@@ -1,5 +1,6 @@
 import { app, BrowserWindow, Menu, shell } from 'electron'
 import path from 'path'
+import { writeFileSync } from 'fs'
 import { SettingsManager } from './services/settings'
 import { LibraryManager } from './services/library'
 import { GitService } from './services/git'
@@ -17,6 +18,7 @@ function createWindow(): void {
     minHeight: 640,
     show: false,
     title: 'Trove Skills',
+    frame: false, // 无边框窗口，标题栏与窗口按钮由应用内实现
     webPreferences: {
       preload: path.join(__dirname, '../preload/index.js'),
       contextIsolation: true,
@@ -26,6 +28,27 @@ function createWindow(): void {
   })
 
   mainWindow.on('ready-to-show', () => mainWindow?.show())
+
+  // 冒烟截图（内部验证用）：设置 TROVE_SMOKE_SHOT=输出路径 时，启动后自动截图退出
+  const smokeShot = process.env['TROVE_SMOKE_SHOT']
+  if (smokeShot) {
+    mainWindow.webContents.once('did-finish-load', () => {
+      setTimeout(() => {
+        void mainWindow?.webContents.capturePage().then((img) => {
+          if (img) writeFileSync(smokeShot, img.toPNG())
+          app.quit()
+        })
+      }, 2600)
+    })
+  }
+
+  // 最大化状态变化推送给渲染进程（标题栏按钮图标切换）
+  mainWindow.on('maximize', () => {
+    mainWindow?.webContents.send('window:maximize-changed', true)
+  })
+  mainWindow.on('unmaximize', () => {
+    mainWindow?.webContents.send('window:maximize-changed', false)
+  })
 
   mainWindow.webContents.setWindowOpenHandler((details) => {
     void shell.openExternal(details.url)

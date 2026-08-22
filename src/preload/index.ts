@@ -9,6 +9,17 @@ import type {
 } from '../shared/types'
 
 const api = {
+  // 窗口控制（无边框标题栏）
+  minimizeWindow: (): Promise<void> => ipcRenderer.invoke('window:minimize'),
+  toggleMaximizeWindow: (): Promise<void> => ipcRenderer.invoke('window:toggleMaximize'),
+  closeWindow: (): Promise<void> => ipcRenderer.invoke('window:close'),
+  isMaximized: (): Promise<boolean> => ipcRenderer.invoke('window:isMaximized'),
+  onMaximizeChange: (cb: (maximized: boolean) => void): (() => void) => {
+    const listener = (_e: unknown, maximized: boolean): void => cb(maximized)
+    ipcRenderer.on('window:maximize-changed', listener)
+    return () => ipcRenderer.removeListener('window:maximize-changed', listener)
+  },
+
   // 设置
   getSettings: (): Promise<AppSettings> => ipcRenderer.invoke('settings:get'),
   updateSettings: (data: AppSettings): Promise<void> => ipcRenderer.invoke('settings:update', data),

@@ -33,6 +33,23 @@ export class IpcRegistrar {
   ) {}
 
   register(): void {
+    // ---------- 窗口控制（无边框标题栏） ----------
+    ipcMain.handle('window:minimize', () => {
+      BrowserWindow.getFocusedWindow()?.minimize()
+    })
+    ipcMain.handle('window:toggleMaximize', () => {
+      const win = BrowserWindow.getFocusedWindow()
+      if (!win) return
+      if (win.isMaximized()) win.unmaximize()
+      else win.maximize()
+    })
+    ipcMain.handle('window:close', () => {
+      BrowserWindow.getFocusedWindow()?.close()
+    })
+    ipcMain.handle('window:isMaximized', () => {
+      return BrowserWindow.getFocusedWindow()?.isMaximized() ?? false
+    })
+
     // ---------- 设置 ----------
     ipcMain.handle('settings:get', () => this.settings.load())
     ipcMain.handle('settings:update', (_e, data: AppSettings) => this.settings.save(data))

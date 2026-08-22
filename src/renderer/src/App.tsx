@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react'
 import type { AppSettings, ProjectRecord, SkillInfo } from '@shared/types'
 import { ToastProvider } from './toast'
+import { TitleBar } from './components/TitleBar'
 import { LibraryPage } from './pages/LibraryPage'
 import { ProjectsPage } from './pages/ProjectsPage'
 import { SettingsPage } from './pages/SettingsPage'
@@ -33,12 +34,10 @@ export default function App(): React.JSX.Element {
 
   return (
     <ToastProvider>
-      <div className="app">
-        <aside className="sidebar">
-          <div className="brand">
-            <span className="mark">🗃️</span>
-            Trove Skills
-          </div>
+      <div className="shell">
+        <TitleBar />
+        <div className="app">
+          <aside className="sidebar">
           <button
             className={`nav-item ${view === 'library' ? 'active' : ''}`}
             onClick={() => setView('library')}
@@ -91,6 +90,7 @@ export default function App(): React.JSX.Element {
             />
           )}
         </main>
+        </div>
       </div>
     </ToastProvider>
   )
