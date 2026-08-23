@@ -1,4 +1,4 @@
-import { ipcMain, dialog, BrowserWindow } from 'electron'
+import { ipcMain, dialog, BrowserWindow, app } from 'electron'
 import { promises as fs } from 'fs'
 import path from 'path'
 import { randomUUID } from 'crypto'
@@ -11,7 +11,7 @@ import type {
 } from '@shared/types'
 import { SettingsManager } from './services/settings'
 import { LibraryManager } from './services/library'
-import { GitService } from './services/git'
+import { GitService, repoNameOf } from './services/git'
 import { LinksManager } from './services/links'
 import { LlmService } from './services/llm'
 
@@ -29,7 +29,8 @@ export class IpcRegistrar {
     private readonly library: LibraryManager,
     private readonly git: GitService,
     private readonly links: LinksManager,
-    private readonly tmpDir: string
+    private readonly tmpDir: string,
+    private readonly zhCacheDir: string
   ) {}
 
   register(): void {
@@ -53,6 +54,10 @@ export class IpcRegistrar {
     // ---------- 设置 ----------
     ipcMain.handle('settings:get', () => this.settings.load())
     ipcMain.handle('settings:update', (_e, data: AppSettings) => this.settings.save(data))
+    ipcMain.handle('app:version', () => ({
+      version: app.getVersion(),
+      buildAt: new Date().toLocaleString('zh-CN', { hour12: false })
+    }))
     ipcMain.handle('settings:chooseSkillsDir', async () => {
       const win = BrowserWindow.getFocusedWindow()
       if (!win) return null
@@ -103,17 +108,24 @@ export class IpcRegistrar {
         if (clean) win?.webContents.send('install:progress', clean.slice(0, 160))
       })
       const skills = await this.git.detectSkills(cloneDir)
-      return { repoUrl: url, cloneDir, skills, commit }
+      const description = await this.git.repoDescription(cloneDir)
+      return { repoUrl: url, repoName: repoNameOf(url), description, cloneDir, skills, commit }
     })
     ipcMain.handle(
       'install:confirm',
       async (
         _e,
-        preview: InstallPreview & { selections: { repoPath: string; name: string }[] }
+        payload: InstallPreview & {
+          selections: { repoPath: string; name: string }[]
+          generateZh?: boolean
+        }
       ) => {
+        const { selections, generateZh, ...preview } = payload
         try {
           const results: { name: string; ok: boolean; message: string }[] = []
-          for (const sel of preview.selections) {
+          let zhNote = ''
+          let groupDone = false
+          for (const sel of selections) {
             try {
               const srcDir = path.join(preview.cloneDir, sel.repoPath)
               const info = await this.library.install(srcDir, sel.name, {
@@ -123,7 +135,34 @@ export class IpcRegistrar {
                 installedAt: new Date().toISOString(),
                 commit: preview.commit
               })
-              results.push({ name: info.name, ok: true, message: '安装成功' })
+              // 同一仓库只维护一次分组元数据（首个成功技能）
+              if (!groupDone) {
+                groupDone = true
+                const description = await this.git.repoDescription(preview.cloneDir)
+                await this.library.upsertGroup({
+                  url: preview.repoUrl,
+                  name: preview.repoName,
+                  description,
+                  installedAt: new Date().toISOString()
+                })
+              }
+              // 为每个技能生成中文描述（索引级，不修改 SKILL.md）
+              if (generateZh) {
+                try {
+                  const s = await this.settings.load()
+                  const profile = s.llmProfiles.find((p) => p.id === s.activeLlmProfileId)
+                  if (profile) {
+                    const { summary } = await this.llm.summarizeSkill(profile, info)
+                    if (summary.description) {
+                      await this.library.setSkillZh(info.name, summary.description)
+                      zhNote = '，中文描述已生成'
+                    }
+                  }
+                } catch (e) {
+                  zhNote = `，中文描述生成失败（${e instanceof Error ? e.message : String(e)}）`
+                }
+              }
+              results.push({ name: info.name, ok: true, message: '安装成功' + zhNote })
             } catch (e) {
               results.push({
                 name: sel.name,
@@ -140,6 +179,88 @@ export class IpcRegistrar {
         }
       }
     )
+    // 技能级中文描述写入（渲染层先用 llm:summarize 生成，再调用本接口存入索引）
+    ipcMain.handle('skills:setZh', (_e, name: string, descriptionZh: string) =>
+      this.library.setSkillZh(name, descriptionZh)
+    )
+    // 批量卸载技能
+    ipcMain.handle('skills:batchUninstall', async (_e, names: string[]) => {
+      const results: { name: string; ok: boolean; message: string }[] = []
+      for (const name of names) {
+        try {
+          await this.library.uninstall(name)
+          results.push({ name, ok: true, message: '已卸载' })
+        } catch (e) {
+          results.push({ name, ok: false, message: e instanceof Error ? e.message : String(e) })
+        }
+      }
+      return results
+    })
+    // 仓库分组：删除整组（卸载组内全部技能）
+    ipcMain.handle('groups:remove', async (_e, url: string) => {
+      const removed = await this.library.removeGroup(url)
+      return removed
+    })
+    // 仓库分组：编辑备注
+    ipcMain.handle('groups:setNote', (_e, url: string, note: string) =>
+      this.library.setGroupNote(url, note)
+    )
+    ipcMain.handle('install:updateMany', async (_e, skills: SkillInfo[]) => {
+      const results: { name: string; ok: boolean; message: string }[] = []
+      // 按仓库分组：同一仓库只浅克隆一次
+      const byUrl = new Map<string, SkillInfo[]>()
+      for (const s of skills) {
+        if (s.source?.kind !== 'git' || !s.source.url) continue
+        const list = byUrl.get(s.source.url) ?? []
+        list.push(s)
+        byUrl.set(s.source.url, list)
+      }
+      for (const [url, list] of byUrl) {
+        const previewId = randomUUID()
+        const cloneDir = path.join(this.tmpDir, `preview-${previewId}`)
+        let repoSkills: Awaited<ReturnType<typeof this.git.detectSkills>>
+        try {
+          const commit = await this.git.cloneShallow(url, cloneDir)
+          repoSkills = await this.git.detectSkills(cloneDir)
+          for (const skill of list) {
+            const match = repoSkills.find(
+              (s) =>
+                s.name === skill.name || (skill.source?.repoPath && s.repoPath === skill.source.repoPath)
+            )
+            if (!match) {
+              results.push({ name: skill.name, ok: false, message: '仓库中未再找到该技能，可能已被移除' })
+              continue
+            }
+            // 与本地记录的上次 commit 相同 → 已是最新，跳过重写
+            if (skill.source?.commit && skill.source.commit === commit) {
+              results.push({ name: skill.name, ok: true, message: '已是最新，无需更新' })
+              continue
+            }
+            try {
+              await this.library.update(match.name, path.join(cloneDir, match.repoPath), {
+                kind: 'git',
+                url: skill.source?.url ?? url,
+                repoPath: match.repoPath,
+                installedAt: skill.source?.installedAt ?? new Date().toISOString(),
+                lastUpdated: new Date().toISOString(),
+                commit
+              })
+              results.push({ name: skill.name, ok: true, message: '已更新' })
+            } catch (e) {
+              results.push({ name: skill.name, ok: false, message: e instanceof Error ? e.message : String(e) })
+            }
+          }
+        } catch (e) {
+          for (const skill of list) {
+            results.push({ name: skill.name, ok: false, message: e instanceof Error ? e.message : String(e) })
+          }
+        } finally {
+          const previewIdFromDir = path.basename(cloneDir).split('-').pop()
+          if (previewIdFromDir) this.cleanupPreview(previewIdFromDir)
+        }
+      }
+      return results
+    })
     ipcMain.handle('install:update', async (_e, skill: SkillInfo) => {
       if (skill.source?.kind !== 'git' || !skill.source.url) {
         throw new Error('该技能不是 Git 来源，无法更新')
@@ -194,17 +315,32 @@ export class IpcRegistrar {
       })
       return r.canceled ? null : r.filePaths[0]
     })
-    ipcMain.handle('links:addProjectByPath', (_e, projectPath: string) =>
-      this.links.addProject(projectPath)
+    ipcMain.handle('links:addProjectByPath', (_e, projectPath: string, linksRel?: string) =>
+      this.links.addProject(projectPath, linksRel)
+    )
+    ipcMain.handle('links:chooseLinksDir', async () => {
+      const win = BrowserWindow.getFocusedWindow()
+      if (!win) return null
+      const r = await dialog.showOpenDialog(win, {
+        title: '选择技能链接目录（Agent 从此目录读取技能）',
+        properties: ['openDirectory', 'createDirectory']
+      })
+      return r.canceled ? null : r.filePaths[0]
+    })
+    ipcMain.handle('links:changeDir', async (_e, projectId: string, newDir: string) =>
+      this.links.changeLinksDir(projectId, newDir, (name) => this.library.resolveSkillDir(name))
     )
     ipcMain.handle('links:removeProject', (_e, id: string, unlinkAll: boolean) =>
       this.links.removeProject(id, unlinkAll)
     )
     ipcMain.handle(
       'links:link',
-      (_e, projectId: string, skillNames: string[]) =>
-        this.links.linkSkills(projectId, skillNames, (name) =>
-          this.library.resolveSkillDir(name)
+      (_e, projectId: string, skillNames: string[], sync?: boolean) =>
+        this.links.linkSkills(
+          projectId,
+          skillNames,
+          (name) => this.library.resolveSkillDir(name),
+          sync
         )
     )
     ipcMain.handle('links:unlink', (_e, projectId: string, skillName: string) =>
@@ -214,6 +350,25 @@ export class IpcRegistrar {
     // ---------- LLM ----------
     ipcMain.handle('llm:listModels', (_e, profile: LlmProfile) => this.llm.listModels(profile))
     ipcMain.handle('llm:test', (_e, profile: LlmProfile) => this.llm.testProfile(profile))
+    // 技能正文翻译成中文（LLM + 本地缓存 userData/zh-cache/<name>.md）
+    ipcMain.handle('skill:translateZh', async (_e, skill: SkillInfo) => {
+      const cacheFile = path.join(this.zhCacheDir, `${skill.name}.md`)
+      try {
+        const cached = await fs.readFile(cacheFile, 'utf-8')
+        if (cached.trim()) return cached
+      } catch {
+        // 无缓存，继续生成
+      }
+      const s = await this.settings.load()
+      const profile = s.llmProfiles.find((p) => p.id === s.activeLlmProfileId)
+      if (!profile) throw new Error('未配置 LLM，请先在设置中配置')
+      const { content } = await this.llm.translateSkill(profile, skill)
+      const zh = content.trim()
+      if (!zh) throw new Error('翻译结果为空，请重试')
+      await fs.mkdir(this.zhCacheDir, { recursive: true })
+      await fs.writeFile(cacheFile, zh, 'utf-8')
+      return zh
+    })
     ipcMain.handle('llm:summarize', async (_e, skill: SkillInfo) => {
       const profile = await this.settings.getActiveProfile()
       if (!profile) throw new Error('请先在设置中配置并激活 LLM 配置')

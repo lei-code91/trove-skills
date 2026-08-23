@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer } from 'electron'
 import type {
   AppSettings,
   InstallPreview,
+  LibrarySnapshot,
   LlmProfile,
   ProjectRecord,
   SkillInfo,
@@ -23,12 +24,13 @@ const api = {
   // 设置
   getSettings: (): Promise<AppSettings> => ipcRenderer.invoke('settings:get'),
   updateSettings: (data: AppSettings): Promise<void> => ipcRenderer.invoke('settings:update', data),
+  getAppVersion: (): Promise<{ version: string; buildAt: string }> => ipcRenderer.invoke('app:version'),
   chooseSkillsDir: (): Promise<string | null> => ipcRenderer.invoke('settings:chooseSkillsDir'),
   chooseLocalSkillDir: (): Promise<string | null> =>
     ipcRenderer.invoke('settings:chooseLocalSkillDir'),
 
   // 技能库
-  scanLibrary: (): Promise<SkillInfo[]> => ipcRenderer.invoke('library:scan'),
+  scanLibrary: (): Promise<LibrarySnapshot> => ipcRenderer.invoke('library:scan'),
   setSkillStatus: (name: string, status: SkillStatus): Promise<void> =>
     ipcRenderer.invoke('library:setStatus', name, status),
   uninstallSkill: (name: string): Promise<void> => ipcRenderer.invoke('library:uninstall', name),
@@ -48,11 +50,26 @@ const api = {
     ipcRenderer.invoke('install:preview', url),
   confirmInstall: (
     preview: InstallPreview,
-    selections: { repoPath: string; name: string }[]
+    selections: { repoPath: string; name: string }[],
+    opts?: { generateZh?: boolean }
   ): Promise<{ name: string; ok: boolean; message: string }[]> =>
-    ipcRenderer.invoke('install:confirm', { ...preview, selections }),
+    ipcRenderer.invoke('install:confirm', {
+      ...preview,
+      selections,
+      generateZh: opts?.generateZh
+    }),
   updateSkill: (skill: SkillInfo): Promise<SkillInfo> =>
     ipcRenderer.invoke('install:update', skill),
+  updateSkills: (skills: SkillInfo[]): Promise<{ name: string; ok: boolean; message: string }[]> =>
+    ipcRenderer.invoke('install:updateMany', skills),
+  batchUninstall: (names: string[]): Promise<{ name: string; ok: boolean; message: string }[]> =>
+    ipcRenderer.invoke('skills:batchUninstall', names),
+  setSkillZh: (name: string, descriptionZh: string): Promise<void> =>
+    ipcRenderer.invoke('skills:setZh', name, descriptionZh),
+  removeGroup: (url: string): Promise<string[]> =>
+    ipcRenderer.invoke('groups:remove', url),
+  setGroupNote: (url: string, note: string): Promise<void> =>
+    ipcRenderer.invoke('groups:setNote', url, note),
   importLocalSkill: (dir: string, name?: string): Promise<SkillInfo> =>
     ipcRenderer.invoke('install:importLocal', dir, name),
   onInstallProgress: (cb: (line: string) => void): (() => void) => {
@@ -65,12 +82,18 @@ const api = {
   listProjects: (): Promise<ProjectRecord[]> => ipcRenderer.invoke('links:listProjects'),
   addProject: (): Promise<ProjectRecord | null> => ipcRenderer.invoke('links:addProject'),
   chooseProjectDir: (): Promise<string | null> => ipcRenderer.invoke('links:chooseProjectDir'),
-  addProjectByPath: (projectPath: string): Promise<ProjectRecord> =>
-    ipcRenderer.invoke('links:addProjectByPath', projectPath),
+  addProjectByPath: (projectPath: string, linksRel?: string): Promise<ProjectRecord> =>
+    ipcRenderer.invoke('links:addProjectByPath', projectPath, linksRel),
+  chooseLinksDir: (): Promise<string | null> => ipcRenderer.invoke('links:chooseLinksDir'),
+  changeLinksDir: (projectId: string, newDir: string): Promise<ProjectRecord> =>
+    ipcRenderer.invoke('links:changeDir', projectId, newDir),
   removeProject: (id: string, unlinkAll = true): Promise<void> =>
     ipcRenderer.invoke('links:removeProject', id, unlinkAll),
-  linkSkills: (projectId: string, skillNames: string[]): Promise<ProjectRecord> =>
-    ipcRenderer.invoke('links:link', projectId, skillNames),
+  linkSkills: (
+    projectId: string,
+    skillNames: string[],
+    sync?: boolean
+  ): Promise<ProjectRecord> => ipcRenderer.invoke('links:link', projectId, skillNames, sync),
   unlinkSkill: (projectId: string, skillName: string): Promise<ProjectRecord> =>
     ipcRenderer.invoke('links:unlink', projectId, skillName),
 
@@ -94,7 +117,9 @@ const api = {
       skillMd: string
     }
     stats: { model: string; inputTokens: number; outputTokens: number }
-  }> => ipcRenderer.invoke('llm:draft', idea)
+  }> => ipcRenderer.invoke('llm:draft', idea),
+  translateSkillZh: (skill: SkillInfo): Promise<string> =>
+    ipcRenderer.invoke('skill:translateZh', skill)
 }
 
 export type TroveApi = typeof api

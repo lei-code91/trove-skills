@@ -23,6 +23,8 @@ export interface SkillInfo {
   name: string
   title: string
   description: string
+  /** 中文描述（LLM 生成，存索引；可选，不修改 SKILL.md） */
+  descriptionZh?: string
   version?: string
   tags: string[]
   status: SkillStatus
@@ -41,6 +43,10 @@ export interface SkillInfo {
 /** 仓库预览结果（clone 到临时目录后识别） */
 export interface InstallPreview {
   repoUrl: string
+  /** 仓库短名（owner/repo） */
+  repoName: string
+  /** 仓库描述（README 提取的原文，可为空） */
+  description: string
   cloneDir: string
   skills: {
     name: string
@@ -49,6 +55,26 @@ export interface InstallPreview {
     description: string
   }[]
   commit?: string
+}
+
+/** Git 仓库分组：同一 url 下安装的技能归为一组 */
+export interface RepoGroup {
+  /** 仓库 url（组主键） */
+  url: string
+  /** 仓库短名（owner/repo） */
+  name: string
+  /** 原文描述（README 提取） */
+  description: string
+  /** 用户备注（可编辑） */
+  note?: string
+  installedAt: string
+  lastUpdated?: string
+}
+
+/** 主库扫描快照：技能列表 + 仓库分组 */
+export interface LibrarySnapshot {
+  skills: SkillInfo[]
+  groups: RepoGroup[]
 }
 
 /** 项目记录：项目文件夹 + 链接到库的技能 */

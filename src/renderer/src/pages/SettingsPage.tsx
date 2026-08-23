@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import type { AppSettings, LlmProfile } from '@shared/types'
 import { useToast } from '../toast'
 import { Spinner } from '../components/Modal'
@@ -25,6 +25,14 @@ export function SettingsPage({ settings, onChanged }: Props): React.JSX.Element 
   const [draft, setDraft] = useState<AppSettings | null>(settings)
   const [busy, setBusy] = useState<string | null>(null)
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null)
+  const [appVer, setAppVer] = useState('')
+
+  useEffect(() => {
+    void window.trove
+      .getAppVersion()
+      .then((v) => setAppVer(`${v.version} · 构建于 ${v.buildAt}`))
+      .catch(() => setAppVer('未知'))
+  }, [])
 
   // 编辑中的 profile（新增或编辑）
   const [editing, setEditing] = useState<LlmProfile | null>(null)
@@ -350,6 +358,9 @@ export function SettingsPage({ settings, onChanged }: Props): React.JSX.Element 
           </div>
         </div>
       )}
+      <div className="muted" style={{ marginTop: 28, textAlign: 'center', fontSize: 12 }}>
+        Trove Skills v{appVer || '…'}
+      </div>
     </div>
   )
 }

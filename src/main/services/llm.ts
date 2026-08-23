@@ -112,6 +112,35 @@ ${skill.readme.slice(0, 6000)}
     }
   }
 
+  /** AI 翻译：把 SKILL.md 正文翻译成中文（保留 Markdown 结构与代码） */
+  async translateSkill(
+    profile: LlmProfile,
+    skill: SkillInfo
+  ): Promise<{ content: string; stats: AiStats }> {
+    const prompt = `把以下 Agent Skill（SKILL.md）正文翻译成中文。要求：
+1. 保留原有 Markdown 结构（标题、列表、代码块、表格等）
+2. 代码、命令、文件路径、标识符不翻译
+3. 术语首次出现可附英文，如“测试驱动开发（TDD）”
+
+技能名：${skill.name}
+
+原文：
+---
+${skill.readme.slice(0, 20000)}
+---`
+    return this.chat(
+      profile,
+      [
+        {
+          role: 'system',
+          content: '你是技术文档翻译专家。输出中文 Markdown，保留结构与代码原样，只输出翻译结果，不要任何解释。'
+        },
+        { role: 'user', content: prompt }
+      ],
+      { maxTokens: 8192 }
+    )
+  }
+
   /** AI 创建技能：一句话需求 → 完整 SKILL.md 草案 */
   async draftSkill(profile: LlmProfile, idea: string): Promise<{ draft: CreateSkillDraft; stats: AiStats }> {
     const prompt = `你是 AI Agent Skill 设计专家。请根据以下需求，生成一个技能（Skill）的完整定义。

@@ -86,7 +86,7 @@ async function main() {
   console.log('✓ duplicate install rejected:', dupError)
 
   const scanned = await library.scan()
-  console.log('✓ scan:', scanned.map((s) => `${s.name}(${s.status}/${s.source?.kind})`).join(', '))
+  console.log('✓ scan:', scanned.skills.map((s) => `${s.name}(${s.status}/${s.source?.kind})`).join(', '))
 
   fs.mkdirSync(PROJECT, { recursive: true })
   const project = await links.addProject(PROJECT)
@@ -125,7 +125,7 @@ async function main() {
 
   await library.uninstall('sub-skill')
   const afterUninstall = await library.scan()
-  console.log('✓ uninstall, remaining:', afterUninstall.map((s) => s.name).join(', '))
+  console.log('✓ uninstall, remaining:', afterUninstall.skills.map((s) => s.name).join(', '))
 
   const draft = await library.createDraft('ai-skill', '---\nname: ai-skill\ndescription: AI 生成\n---\n# AI\n正文')
   console.log('✓ ai draft saved:', draft.name, draft.status)
@@ -135,7 +135,7 @@ async function main() {
   fs.mkdirSync(SKILLS_DIR + '/plain-skill', { recursive: true })
   fs.writeFileSync(SKILLS_DIR + '/plain-skill/SKILL.md', '# Plain\n\n正文', 'utf-8')
   const plain = await library.scan()
-  const plainSkill = plain.find((s) => s.name === 'plain-skill')
+  const plainSkill = plain.skills.find((s) => s.name === 'plain-skill')
   console.log('✓ plain skill parsed:', plainSkill?.title, '| desc:', plainSkill?.description?.slice(0, 10))
 
   console.log('\n✅ ALL E2E CHECKS PASSED')

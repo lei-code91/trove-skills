@@ -1,7 +1,15 @@
 import { promises as fs } from 'fs'
 import path from 'path'
+import os from 'os'
 import { randomUUID } from 'crypto'
 import type { ProjectLink, ProjectRecord } from '@shared/types'
+
+/** 展开 ~ / ~/xxx 为用户主目录 */
+function expandHome(p: string): string {
+  if (p === '~') return os.homedir()
+  if (p.startsWith('~/') || p.startsWith('~\\')) return path.join(os.homedir(), p.slice(2))
+  return p
+}
 
 /**
  * 项目链接服务：把主库中的技能用 junction（Windows）/ 符号链接（其它平台）映射到
@@ -32,15 +40,18 @@ export class LinksManager {
     await fs.rename(tmp, this.projectsFile)
   }
 
-  /** 添加项目（若已存在则返回现有记录） */
-  async addProject(projectPath: string): Promise<ProjectRecord> {
+  /** 添加项目（若已存在则返回现有记录）；linksRel：链接目录（相对项目根、绝对路径或 ~ 用户级目录），默认 skills */
+  async addProject(projectPath: string, linksRel?: string): Promise<ProjectRecord> {
     const absolute = path.resolve(projectPath)
     const stat = await fs.stat(absolute)
     if (!stat.isDirectory()) throw new Error('所选路径不是文件夹')
     const list = await this.load()
     const existing = list.find((p) => path.resolve(p.path) === absolute)
     if (existing) return existing
-    const skillsDir = path.join(absolute, 'skills')
+    const rel = expandHome(linksRel ?? 'skills')
+    const skillsDir = path.isAbsolute(rel)
+      ? path.resolve(rel)
+      : path.join(absolute, rel)
     await fs.mkdir(skillsDir, { recursive: true })
     const record: ProjectRecord = {
       id: randomUUID(),
@@ -53,6 +64,27 @@ export class LinksManager {
     list.push(record)
     await this.save(list)
     return record
+  }
+
+  /** 变更链接目录：断开全部旧链接 → 在新目录重建（保持链接集合） */
+  async changeLinksDir(
+    projectId: string,
+    newDir: string,
+    getSkillDir: (name: string) => Promise<string>
+  ): Promise<ProjectRecord> {
+    const list = await this.load()
+    const record = list.find((p) => p.id === projectId)
+    if (!record) throw new Error('项目不存在')
+    const names = record.links.map((l) => l.skillName)
+    for (const link of record.links) {
+      await this.safeRemoveLink(link.linkPath)
+    }
+    record.links = []
+    record.skillsDir = path.resolve(expandHome(newDir))
+    await fs.mkdir(record.skillsDir, { recursive: true })
+    // 先落盘再重建：linkSkills 内部会重新 load，视新目录为当前状态
+    await this.save(list)
+    return this.linkSkills(projectId, names, getSkillDir)
   }
 
   async removeProject(id: string, unlinkAll = true): Promise<void> {
@@ -91,8 +123,13 @@ export class LinksManager {
     return list
   }
 
-  /** 把技能链接进项目 skills 目录（多个技能一次批量） */
-  async linkSkills(projectId: string, skillNames: string[], getSkillDir: (name: string) => Promise<string>): Promise<ProjectRecord> {
+  /** 把技能链接进项目 skills 目录（多个技能一次批量）；sync=true 时全量对齐：未勾选的既有链接一并断开 */
+  async linkSkills(
+    projectId: string,
+    skillNames: string[],
+    getSkillDir: (name: string) => Promise<string>,
+    sync = false
+  ): Promise<ProjectRecord> {
     const list = await this.load()
     const record = list.find((p) => p.id === projectId)
     if (!record) throw new Error('项目不存在')
@@ -124,6 +161,15 @@ export class LinksManager {
         targetPath: target,
         linkedAt: new Date().toISOString()
       })
+    }
+    // sync：断开未勾选的既有链接（管理弹窗“保存”语义）
+    if (sync) {
+      for (const link of [...record.links]) {
+        if (!skillNames.includes(link.skillName)) {
+          await this.safeRemoveLink(link.linkPath)
+          record.links = record.links.filter((l) => l.skillName !== link.skillName)
+        }
+      }
     }
     await this.save(list)
     return record

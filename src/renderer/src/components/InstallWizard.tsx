@@ -14,9 +14,11 @@ interface InstallResult {
 
 interface Props {
   onDone: () => void
+  /** 是否已配置 LLM（决定「生成中文描述」选项可用性） */
+  llmReady?: boolean
 }
 
-export function InstallWizard({ onDone }: Props): React.JSX.Element {
+export function InstallWizard({ onDone, llmReady = false }: Props): React.JSX.Element {
   const { push } = useToast()
   const [step, setStep] = useState<Step>('input')
   const [url, setUrl] = useState('')
@@ -27,6 +29,8 @@ export function InstallWizard({ onDone }: Props): React.JSX.Element {
   const [progress, setProgress] = useState<string[]>([])
   const [results, setResults] = useState<InstallResult[]>([])
   const [selectedName, setSelectedName] = useState<string | null>(null)
+  // 是否为仓库生成中文描述（需 LLM）
+  const [generateZh, setGenerateZh] = useState(false)
 
   const close = (): void => {
     setStep('input')
@@ -35,6 +39,7 @@ export function InstallWizard({ onDone }: Props): React.JSX.Element {
     setProgress([])
     setResults([])
     setError('')
+    setGenerateZh(false)
     onDone()
   }
 
@@ -79,7 +84,7 @@ export function InstallWizard({ onDone }: Props): React.JSX.Element {
         setError('请至少选择一个技能')
         return
       }
-      const res = await window.trove.confirmInstall(preview, selections)
+      const res = await window.trove.confirmInstall(preview, selections, { generateZh })
       setResults(res)
       setStep('result')
     } catch (e) {
@@ -87,7 +92,7 @@ export function InstallWizard({ onDone }: Props): React.JSX.Element {
     } finally {
       setBusy(false)
     }
-  }, [preview, selected])
+  }, [preview, selected, generateZh])
 
   const finish = (): void => {
     const failed = results.filter((r) => !r.ok)
@@ -167,6 +172,30 @@ export function InstallWizard({ onDone }: Props): React.JSX.Element {
       {step === 'preview' && preview && (
         <>
           <div className="settings-hint mono">{preview.repoUrl}</div>
+          <div className="card repo-card">
+            <div className="row" style={{ gap: 8 }}>
+              <span style={{ fontSize: 15 }}>📦</span>
+              <b>{preview.repoName}</b>
+              <span className="muted">（{preview.skills.length} 个技能）</span>
+            </div>
+            {preview.description && <div className="repo-desc">{preview.description}</div>}
+            <label className="check-item" style={{ marginTop: 8 }}>
+              <input
+                type="checkbox"
+                checked={generateZh}
+                onChange={(e) => setGenerateZh(e.target.checked)}
+                disabled={busy || !llmReady}
+              />
+              <span>
+                🌐 <b>为每个技能生成中文描述</b>
+                {llmReady ? (
+                  <span className="muted">（用 LLM 生成各技能的中文摘要，不修改原文）</span>
+                ) : (
+                  <span className="muted">（需先在设置中配置 LLM）</span>
+                )}
+              </span>
+            </label>
+          </div>
           {progress.length > 0 && (
             <div className="progress-log">
               {progress.map((l, i) => (

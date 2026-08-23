@@ -117,7 +117,14 @@ app.whenReady().then(() => {
   )
   const git = new GitService(async () => (await settings.load()).gitPath)
   const links = new LinksManager(() => userData)
-  ipcRegistrar = new IpcRegistrar(settings, library, git, links, path.join(userData, 'tmp'))
+  ipcRegistrar = new IpcRegistrar(
+    settings,
+    library,
+    git,
+    links,
+    path.join(userData, 'tmp'),
+    path.join(userData, 'zh-cache')
+  )
   ipcRegistrar.register()
 
   buildMenu()

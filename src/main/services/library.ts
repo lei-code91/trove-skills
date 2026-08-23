@@ -1,15 +1,30 @@
 import { promises as fs } from 'fs'
 import path from 'path'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
-import type { SkillInfo, SkillSource, SkillStatus } from '@shared/types'
+import type { LibrarySnapshot, RepoGroup, SkillInfo, SkillSource, SkillStatus } from '@shared/types'
 
 const SKILL_FILE = 'SKILL.md'
 
+interface SkillMeta {
+  status: SkillStatus
+  source?: SkillSource
+  /** 中文描述（LLM 生成，存索引不写文件） */
+  descriptionZh?: string
+}
+
+/** 索引文件结构：技能表 + 仓库分组表 */
 interface LibraryIndex {
-  [skillName: string]: {
-    status: SkillStatus
-    source?: SkillSource
+  skills: Record<string, SkillMeta>
+  groups: Record<string, RepoGroup>
+}
+
+/** 读取索引；兼容旧格式（顶层直接是技能表） */
+function migrateIndex(data: unknown): LibraryIndex {
+  if (data && typeof data === 'object' && !('skills' in data)) {
+    return { skills: data as Record<string, SkillMeta>, groups: {} }
   }
+  const d = (data ?? {}) as { skills?: Record<string, SkillMeta>; groups?: Record<string, RepoGroup> }
+  return { skills: d.skills ?? {}, groups: d.groups ?? {} }
 }
 
 /**
@@ -26,16 +41,16 @@ export class LibraryManager {
   private async getIndex(): Promise<LibraryIndex> {
     try {
       const raw = await fs.readFile(this.indexFile, 'utf-8')
-      return JSON.parse(raw) as LibraryIndex
+      return migrateIndex(JSON.parse(raw))
     } catch {
-      return {}
+      return { skills: {}, groups: {} }
     }
   }
 
   private async saveIndex(index: LibraryIndex): Promise<void> {
     await fs.mkdir(path.dirname(this.indexFile), { recursive: true })
     const tmp = this.indexFile + '.tmp'
-    await fs.writeFile(tmp, JSON.stringify(index, null, 2), 'utf-8')
+    await fs.writeFile(tmp, JSON.stringify({ skills: index.skills, groups: index.groups }, null, 2), 'utf-8')
     await fs.rename(tmp, this.indexFile)
   }
 
@@ -83,8 +98,8 @@ export class LibraryManager {
     }
   }
 
-  /** 扫描主库全部技能（合并索引中的状态与来源） */
-  async scan(): Promise<SkillInfo[]> {
+  /** 扫描主库：技能列表 + 仓库分组（快照） */
+  async scan(): Promise<LibrarySnapshot> {
     const dir = await this.skillsDir()
     await fs.mkdir(dir, { recursive: true })
     const index = await this.getIndex()
@@ -92,7 +107,7 @@ export class LibraryManager {
     try {
       entries = await fs.readdir(dir, { withFileTypes: true })
     } catch {
-      return []
+      return { skills: [], groups: [] }
     }
     const dirs = entries.filter((e) => e.isDirectory())
     const result: SkillInfo[] = []
@@ -113,10 +128,13 @@ export class LibraryManager {
         })
         continue
       }
-      const meta = index[info.name]
+      const meta = index.skills[info.name]
       if (meta) {
         info.status = meta.status
         info.source = meta.source
+        if (typeof meta.descriptionZh === 'string' && meta.descriptionZh.trim()) {
+          info.descriptionZh = meta.descriptionZh
+        }
       } else {
         info.source = { kind: 'local', installedAt: info.updatedAt }
       }
@@ -124,7 +142,68 @@ export class LibraryManager {
     }
     // 技能名排序（中文按拼音近似，用 localeCompare）
     result.sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN'))
-    return result
+    return { skills: result, groups: this.groupsFromIndex(index) }
+  }
+
+  /** 全部仓库分组（按短名排序） */
+  private groupsFromIndex(index: LibraryIndex): RepoGroup[] {
+    return Object.values(index.groups).sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN'))
+  }
+
+  /** 仓库分组：按 url 读取 */
+  async getGroup(url: string): Promise<RepoGroup | undefined> {
+    const index = await this.getIndex()
+    return index.groups[url]
+  }
+
+  /** 仓库分组：建立或更新（url 为键，lastUpdated 自动刷新） */
+  async upsertGroup(group: RepoGroup): Promise<void> {
+    const index = await this.getIndex()
+    const prev = index.groups[group.url]
+    index.groups[group.url] = { ...prev, ...group, lastUpdated: new Date().toISOString() }
+    await this.saveIndex(index)
+  }
+
+  /** 仓库分组：写入用户备注 */
+  async setGroupNote(url: string, note: string): Promise<void> {
+    const index = await this.getIndex()
+    if (index.groups[url]) {
+      index.groups[url].note = note.trim() || undefined
+      index.groups[url].lastUpdated = new Date().toISOString()
+      await this.saveIndex(index)
+    }
+  }
+
+  /** 仓库分组：删除整组（卸载组内全部技能目录 + 移除分组元数据） */
+  async removeGroup(url: string): Promise<string[]> {
+    const dir = await this.skillsDir()
+    const removed: string[] = []
+    const index = await this.getIndex()
+    for (const [name, meta] of Object.entries(index.skills)) {
+      if (meta.source?.url === url) {
+        const dest = path.join(dir, name)
+        if (await exists(dest)) {
+          await fs.rm(dest, { recursive: true, force: true })
+        }
+        delete index.skills[name]
+        removed.push(name)
+      }
+    }
+    delete index.groups[url]
+    await this.saveIndex(index)
+    return removed
+  }
+
+  /** 技能级中文描述：写入索引（不修改 SKILL.md） */
+  async setSkillZh(name: string, descriptionZh: string): Promise<void> {
+    const index = await this.getIndex()
+    const meta = index.skills[name]
+    if (meta) {
+      meta.descriptionZh = descriptionZh.trim().slice(0, 300) || undefined
+      await this.saveIndex(index)
+    } else {
+      throw new Error(`技能 ${name} 不在索引中`)
+    }
   }
 
   /** 安装：将临时目录中的技能目录复制进主库（不含 .git） */
@@ -141,7 +220,7 @@ export class LibraryManager {
     }
     await copyDir(srcDir, dest)
     const index = await this.getIndex()
-    index[name] = { status: 'installed', source }
+    index.skills[name] = { status: 'installed', source }
     await this.saveIndex(index)
     const info = await this.parseSkillDir(dest)
     if (!info) throw new Error(`安装后未找到有效 SKILL.md：${dest}`)
@@ -160,12 +239,12 @@ export class LibraryManager {
     await fs.rm(dest, { recursive: true, force: true })
     await copyDir(srcDir, dest)
     const index = await this.getIndex()
-    const prev = index[name]
-    index[name] = { status: prev?.status ?? 'installed', source }
+    const prev = index.skills[name]
+    index.skills[name] = { status: prev?.status ?? 'installed', source }
     await this.saveIndex(index)
     const info = await this.parseSkillDir(dest)
     if (!info) throw new Error(`更新后未找到有效 SKILL.md：${dest}`)
-    info.status = index[name].status
+    info.status = index.skills[name].status
     info.source = source
     return info
   }
@@ -176,14 +255,20 @@ export class LibraryManager {
     if (!(await exists(dest))) throw new Error(`技能 ${name} 不在主库中`)
     await fs.rm(dest, { recursive: true, force: true })
     const index = await this.getIndex()
-    delete index[name]
+    const url = index.skills[name]?.source?.url
+    delete index.skills[name]
+    // 组内最后一个技能被卸载时，移除空组
+    if (url) {
+      const stillHas = Object.values(index.skills).some((m) => m.source?.url === url)
+      if (!stillHas) delete index.groups[url]
+    }
     await this.saveIndex(index)
   }
 
   async setStatus(name: string, status: SkillStatus): Promise<void> {
     const index = await this.getIndex()
-    if (!index[name]) index[name] = { status }
-    else index[name].status = status
+    if (!index.skills[name]) index.skills[name] = { status }
+    else index.skills[name].status = status
     await this.saveIndex(index)
   }
 
@@ -207,7 +292,7 @@ export class LibraryManager {
     info.status = 'installed'
     info.source = source
     const index = await this.getIndex()
-    index[info.name] = { status: 'installed', source }
+    index.skills[info.name] = { status: 'installed', source }
     await this.saveIndex(index)
     return info
   }
@@ -223,7 +308,7 @@ export class LibraryManager {
     const info = await this.parseSkillDir(dest)
     if (info) {
       const index = await this.getIndex()
-      const meta = index[name]
+      const meta = index.skills[name]
       if (meta) {
         info.status = meta.status
         info.source = meta.source

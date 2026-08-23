@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react'
-import type { AppSettings, ProjectRecord, SkillInfo } from '@shared/types'
+import type { AppSettings, ProjectRecord, RepoGroup, SkillInfo } from '@shared/types'
 import { ToastProvider } from './toast'
 import { TitleBar } from './components/TitleBar'
 import { LibraryPage } from './pages/LibraryPage'
@@ -12,17 +12,19 @@ export default function App(): React.JSX.Element {
   const [view, setView] = useState<View>('library')
   const [settings, setSettings] = useState<AppSettings | null>(null)
   const [skills, setSkills] = useState<SkillInfo[]>([])
+  const [groups, setGroups] = useState<RepoGroup[]>([])
   const [projects, setProjects] = useState<ProjectRecord[]>([])
   const [activeProfileName, setActiveProfileName] = useState<string | null>(null)
 
   const refresh = useCallback(async () => {
-    const [s, sk, pr] = await Promise.all([
+    const [s, snap, pr] = await Promise.all([
       window.trove.getSettings(),
       window.trove.scanLibrary(),
       window.trove.listProjects()
     ])
     setSettings(s)
-    setSkills(sk)
+    setSkills(snap.skills)
+    setGroups(snap.groups)
     setProjects(pr)
     const p = s.llmProfiles.find((x) => x.id === s.activeLlmProfileId)
     setActiveProfileName(p ? `${p.name} · ${p.model}` : null)
@@ -72,6 +74,7 @@ export default function App(): React.JSX.Element {
           {view === 'library' && (
             <LibraryPage
               skills={skills}
+              groups={groups}
               settings={settings}
               onChanged={() => void refresh()}
             />
@@ -80,6 +83,7 @@ export default function App(): React.JSX.Element {
             <ProjectsPage
               projects={projects}
               skills={skills}
+              groups={groups}
               onChanged={() => void refresh()}
             />
           )}
