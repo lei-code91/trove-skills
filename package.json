@@ -1,6 +1,6 @@
 {
   "name": "trove-skills",
-  "version": "0.2.0",
+  "version": "0.1.0",
   "description": "AI Agent Skills 管理桌面应用：从 Git 仓库安装技能到主库，按项目链接所需技能，LLM 辅助管理",
   "main": "./out/main/index.js",
   "author": "Flyyun.Lei",
