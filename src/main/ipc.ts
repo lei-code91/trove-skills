@@ -184,6 +184,30 @@ export class IpcRegistrar {
     ipcMain.handle('skills:setZh', (_e, name: string, descriptionZh: string) =>
       this.library.setSkillZh(name, descriptionZh)
     )
+    // 批量生成中文描述：逐个 LLM 摘要 + 存索引，跳过已有中文描述，逐个容错
+    ipcMain.handle('skills:batchSummarizeZh', async (_e, skills: SkillInfo[]) => {
+      const profile = await this.settings.getActiveProfile()
+      if (!profile) throw new Error('请先在设置中配置并激活 LLM 配置')
+      const results: { name: string; ok: boolean; message: string }[] = []
+      for (const skill of skills) {
+        try {
+          if (skill.descriptionZh?.trim()) {
+            results.push({ name: skill.name, ok: true, message: '已有中文描述，跳过' })
+            continue
+          }
+          const { summary } = await this.llm.summarizeSkill(profile, skill)
+          if (!summary.description?.trim()) {
+            results.push({ name: skill.name, ok: false, message: '模型返回为空，请重试' })
+            continue
+          }
+          await this.library.setSkillZh(skill.name, summary.description)
+          results.push({ name: skill.name, ok: true, message: '已生成中文描述' })
+        } catch (e) {
+          results.push({ name: skill.name, ok: false, message: e instanceof Error ? e.message : String(e) })
+        }
+      }
+      return results
+    })
     // 批量卸载技能
     ipcMain.handle('skills:batchUninstall', async (_e, names: string[]) => {
       const results: { name: string; ok: boolean; message: string }[] = []

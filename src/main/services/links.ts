@@ -16,9 +16,9 @@ export function normalizeDir(p: string): string {
   return path.resolve(expandHome(p)).replace(/[\\/]+$/, '')
 }
 
-/** 位点归一化 */
+/** 位点归一化：补 enabled（缺省启用） */
 function normalizeSite(site: LinksSite): LinksSite {
-  return { ...site, dir: normalizeDir(site.dir) }
+  return { ...site, dir: normalizeDir(site.dir), enabled: site.enabled !== false }
 }
 
 /** 归一化后按目录去重（保留首个），避免同一目录以不同写法重复出现 */
@@ -34,7 +34,17 @@ function dedupeSites(sites: LinksSite[]): LinksSite[] {
   return out
 }
 
-/** 旧项目数据的位点类型推导：全局目录 / 项目内 .claude/skills / 其它自定义 */
+/** 只返回启用位点（enabled 缺省视为启用） */
+function enabledSites(sites: LinksSite[]): LinksSite[] {
+  return sites.filter((s) => s.enabled !== false)
+}
+
+/** 判断是否为全局位点：类型标记或目录本身指向用户级通配目录 */
+function isGlobalSite(site: LinksSite): boolean {
+  return site.kind === 'global' || site.dir === normalizeDir('~/.agents/skills')
+}
+
+/** 旧项目数据的位点类型推导：全局目录 / 项目内 .claude/skills / 其它自定义（仅用于识别旧数据） */
 function deduceKind(projectPath: string, dir: string): LinksSite['kind'] {
   const normalized = normalizeDir(dir)
   if (normalized === normalizeDir('~/.agents/skills')) return 'global'
@@ -42,18 +52,6 @@ function deduceKind(projectPath: string, dir: string): LinksSite['kind'] {
     return 'claude'
   }
   return 'custom'
-}
-
-/** 旧项目数据迁移：补 sites 与每条 link 的 dir；新数据仅做归一化 */
-function migrateProject(p: ProjectRecord): ProjectRecord {
-  const record: ProjectRecord = { ...p, links: [...(p.links ?? [])] }
-  record.sites =
-    Array.isArray(p.sites) && p.sites.length > 0
-      ? p.sites.map(normalizeSite)
-      : [{ dir: normalizeDir(p.skillsDir), kind: deduceKind(p.path, p.skillsDir) }]
-  record.skillsDir = record.sites[0].dir
-  record.links = record.links.map((l) => ({ ...l, dir: l.dir || record.sites[0].dir }))
-  return record
 }
 
 /** 全局配置迁移（兼容缺省/旧格式） */
@@ -81,8 +79,8 @@ function mergeLinks(existing: ProjectLink[], fresh: ProjectLink[]): ProjectLink[
 /**
  * 链接服务（全局 + 项目两级）：
  * - 全局：一套技能集链接到全局位点（默认 ~/.agents/skills），对所有 Agent 生效
- * - 项目：每个项目自己的技能集链接到该项目位点集合（可多条目录）
- * 位点目录内的技能用 junction（Windows）/ 符号链接（其它平台）指向主库 → 主库更新后自动同步。
+ * - 项目：每个项目自己的技能集链接到该项目位点集合（仅项目级位点：claude / custom）
+ * 位点可勾选/取消勾选（enabled）：取消勾选仅停用、保留位置，其下链接断开，重新勾选自动重建。
  */
 export class LinksManager {
   private readonly projectsFile: string
@@ -95,14 +93,71 @@ export class LinksManager {
 
   // ---------- 数据读写 ----------
 
+  /** 读取项目列表：迁移旧数据（补 sites/links.dir/enabled、剥离全局位点），有变更时落盘 */
   private async load(): Promise<ProjectRecord[]> {
+    let list: ProjectRecord[] = []
     try {
       const raw = await fs.readFile(this.projectsFile, 'utf-8')
-      const list = JSON.parse(raw) as ProjectRecord[]
-      return (Array.isArray(list) ? list : []).map(migrateProject)
+      const parsed = JSON.parse(raw)
+      list = Array.isArray(parsed) ? parsed : []
     } catch {
       return []
     }
+    let changed = false
+    const migrated: ProjectRecord[] = []
+    for (const p of list) {
+      const { record, changed: c } = await this.migrateProject(p)
+      if (c) changed = true
+      migrated.push(record)
+    }
+    if (changed) await this.save(migrated)
+    return migrated
+  }
+
+  /** 旧项目数据迁移：补 sites 与 links 的 dir/enabled；项目位点只保留项目级，剥离旧全局位点（断开链接） */
+  private async migrateProject(p: ProjectRecord): Promise<{ record: ProjectRecord; changed: boolean }> {
+    const record: ProjectRecord = {
+      ...p,
+      skillsDir: p.skillsDir,
+      sites: [],
+      links: [...(p.links ?? [])]
+    }
+    let changed = false
+    const rawSites =
+      Array.isArray(p.sites) && p.sites.length > 0
+        ? p.sites
+        : [{ dir: p.skillsDir, kind: deduceKind(p.path, p.skillsDir) }]
+    for (const raw of rawSites) {
+      const site = normalizeSite(raw)
+      if (isGlobalSite(site)) {
+        // 旧「全局用户级」位点：断开其下链接并移除（用户自行到全局链接重新勾选）
+        changed = true
+        for (const link of [...record.links]) {
+          if (normalizeDir(link.dir) === site.dir) {
+            await this.safeRemoveLink(link.linkPath)
+            record.links = record.links.filter((l) => l !== link)
+          }
+        }
+        continue
+      }
+      record.sites.push(site)
+    }
+    // 无项目级位点 → 补默认 Claude 项目级位点，保证链接有一个落点
+    if (record.sites.length === 0) {
+      changed = true
+      record.sites.push({
+        dir: path.join(normalizeDir(p.path), '.claude', 'skills'),
+        kind: 'claude'
+      })
+    }
+    for (const l of record.links) {
+      if (!l.dir) {
+        l.dir = record.sites[0].dir
+        changed = true
+      }
+    }
+    record.skillsDir = record.sites[0].dir
+    return { record, changed }
   }
 
   private async save(list: ProjectRecord[]): Promise<void> {
@@ -188,9 +243,22 @@ export class LinksManager {
     return kept
   }
 
+  /** 断开所有 dir 不在指定目录集合内的链接（用于位点删除/停用） */
+  private async removeLinksOutside(links: ProjectLink[], keepDirs: Set<string>): Promise<ProjectLink[]> {
+    const kept: ProjectLink[] = []
+    for (const link of links) {
+      if (keepDirs.has(link.dir)) kept.push(link)
+      else {
+        await this.safeRemoveLink(link.linkPath)
+        // 仅丢弃当前这条，不在此处重建数组引用（由调用方统一赋值）
+      }
+    }
+    return kept
+  }
+
   // ---------- 项目 ----------
 
-  /** 添加项目（已存在则返回现有记录）；sites 缺省时为项目内 skills 目录 */
+  /** 添加项目（已存在则返回现有记录）；sites 缺省时为项目内 skills 目录；项目位点只允许项目级 */
   async addProject(projectPath: string, sites?: LinksSite[]): Promise<ProjectRecord> {
     const absolute = path.resolve(projectPath)
     const stat = await fs.stat(absolute)
@@ -198,7 +266,7 @@ export class LinksManager {
     const list = await this.load()
     const existing = list.find((p) => path.resolve(p.path) === absolute)
     if (existing) return existing
-    const normalized = dedupeSites(sites ?? [])
+    const normalized = dedupeSites(sites ?? []).filter((s) => !isGlobalSite(s))
     if (normalized.length === 0) {
       normalized.push({ dir: path.join(absolute, 'skills'), kind: 'custom' })
     }
@@ -217,7 +285,7 @@ export class LinksManager {
     return record
   }
 
-  /** 变更项目位点集合：断开不在新位点的链接，为新位点重建既有技能集 */
+  /** 变更项目位点集合：断开不在启用位点的链接（含被停用/删除/全局位点），只在启用位点重建既有技能集 */
   async setSites(
     projectId: string,
     sites: LinksSite[],
@@ -226,16 +294,13 @@ export class LinksManager {
     const list = await this.load()
     const record = list.find((p) => p.id === projectId)
     if (!record) throw new Error('项目不存在')
-    const normalized = dedupeSites(sites)
-    const siteDirs = new Set(normalized.map((s) => s.dir))
-    for (const link of [...record.links]) {
-      if (!siteDirs.has(link.dir)) {
-        await this.safeRemoveLink(link.linkPath)
-        record.links = record.links.filter((l) => l !== link)
-      }
-    }
+    // 项目位点只允许项目级：防御性滤除全局位点（其下链接由 removeLinksOutside 断开）
+    const normalized = dedupeSites(sites).filter((s) => !isGlobalSite(s))
+    const enabled = enabledSites(normalized)
+    const enabledDirs = new Set(enabled.map((s) => s.dir))
+    record.links = await this.removeLinksOutside(record.links, enabledDirs)
     const names = [...new Set(record.links.map((l) => l.skillName))]
-    const fresh = await this.applyLinkSet(normalized, names, getSkillDir)
+    const fresh = await this.applyLinkSet(enabled, names, getSkillDir)
     record.sites = normalized
     record.skillsDir = normalized[0]?.dir ?? record.skillsDir
     record.links = mergeLinks(record.links, fresh)
@@ -271,7 +336,7 @@ export class LinksManager {
     return list
   }
 
-  /** 把技能链接进项目全部位点；sync=true 时全量对齐：未勾选的既有链接一并断开 */
+  /** 把技能链接进项目全部启用位点；sync=true 时全量对齐：未勾选的既有链接一并断开 */
   async linkProject(
     projectId: string,
     skillNames: string[],
@@ -281,9 +346,10 @@ export class LinksManager {
     const list = await this.load()
     const record = list.find((p) => p.id === projectId)
     if (!record) throw new Error('项目不存在')
-    const fresh = await this.applyLinkSet(record.sites, skillNames, getSkillDir)
+    const enabled = enabledSites(record.sites)
+    const fresh = await this.applyLinkSet(enabled, skillNames, getSkillDir)
     record.links = sync
-      ? await this.syncRemove(record.links, record.sites, skillNames)
+      ? await this.syncRemove(record.links, enabled, skillNames)
       : record.links
     record.links = mergeLinks(record.links, fresh)
     await this.save(list)
@@ -317,22 +383,18 @@ export class LinksManager {
     return config
   }
 
-  /** 设定全局位点集合：断开不在新位点的链接，为新位点重建既有技能集 */
+  /** 设定全局位点集合：断开不在启用位点的链接，只在启用位点重建既有技能集 */
   async setGlobalSites(
     sites: LinksSite[],
     getSkillDir: (name: string) => Promise<string>
   ): Promise<GlobalLinks> {
     const config = await this.loadGlobal()
     const normalized = dedupeSites(sites)
-    const siteDirs = new Set(normalized.map((s) => s.dir))
-    for (const link of [...config.links]) {
-      if (!siteDirs.has(link.dir)) {
-        await this.safeRemoveLink(link.linkPath)
-        config.links = config.links.filter((l) => l !== link)
-      }
-    }
+    const enabled = enabledSites(normalized)
+    const enabledDirs = new Set(enabled.map((s) => s.dir))
+    config.links = await this.removeLinksOutside(config.links, enabledDirs)
     const names = [...new Set(config.links.map((l) => l.skillName))]
-    const fresh = await this.applyLinkSet(normalized, names, getSkillDir)
+    const fresh = await this.applyLinkSet(enabled, names, getSkillDir)
     config.sites = normalized
     config.links = mergeLinks(config.links, fresh)
     config.updatedAt = new Date().toISOString()
@@ -340,15 +402,16 @@ export class LinksManager {
     return config
   }
 
-  /** 把技能链接进全局全部位点；sync=true 时未勾选的既有链接一并断开 */
+  /** 把技能链接进全局全部启用位点；sync=true 时未勾选的既有链接一并断开 */
   async linkGlobal(
     skillNames: string[],
     getSkillDir: (name: string) => Promise<string>,
     sync = false
   ): Promise<GlobalLinks> {
     const config = await this.loadGlobal()
-    const fresh = await this.applyLinkSet(config.sites, skillNames, getSkillDir)
-    config.links = sync ? await this.syncRemove(config.links, config.sites, skillNames) : config.links
+    const enabled = enabledSites(config.sites)
+    const fresh = await this.applyLinkSet(enabled, skillNames, getSkillDir)
+    config.links = sync ? await this.syncRemove(config.links, enabled, skillNames) : config.links
     config.links = mergeLinks(config.links, fresh)
     config.updatedAt = new Date().toISOString()
     await this.saveGlobal(config)

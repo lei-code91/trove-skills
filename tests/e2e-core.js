@@ -1,11 +1,12 @@
 /* trove-skills 核心服务端到端验证（不依赖网络，使用本地 git 仓库）
-   覆盖：分组主库布局 / 旧扁平布局自动迁移 / 分组冲突后缀 / 项目位点多选 / 全局链接 */
+   覆盖：分组主库布局 / 旧扁平布局自动迁移 / 分组冲突后缀 / 项目位点多选 / 全局链接 /
+        位点启停（位置保留）/ 唯一技能数去重 / 旧全局位点自动剥离 */
 const path = require('path')
 const fs = require('fs')
 
 const { GitService } = require('D:/Workspace/Temp/trove-e2e/git.cjs')
 const { LibraryManager, sanitizeName } = require('D:/Workspace/Temp/trove-e2e/library.cjs')
-const { LinksManager } = require('D:/Workspace/Temp/trove-e2e/links.cjs')
+const { LinksManager, normalizeDir } = require('D:/Workspace/Temp/trove-e2e/links.cjs')
 
 const BASE = 'D:/Workspace/Temp'
 const REPO_DIR = BASE + '/trove-test-repo'
@@ -238,6 +239,111 @@ async function main() {
   const gUn = await links.unlinkGlobal('root-skill')
   if (fs.existsSync(path.join(GLOBAL_DIR, 'root-skill'))) throw new Error('全局链接未断开')
   console.log('✓ global unlinked, remaining:', gUn.links.map((l) => l.skillName).join(', ') || '（空）')
+
+  // --- 位点启停（位置保留）+ 唯一技能数去重（非 位点数×技能数） ---
+  const PROJECT2 = BASE + '/test-project2'
+  fs.rmSync(PROJECT2, { recursive: true, force: true })
+  fs.mkdirSync(PROJECT2, { recursive: true })
+  const p2 = await links.addProject(PROJECT2, [
+    { dir: path.join(PROJECT2, '.claude', 'skills'), kind: 'claude' },
+    { dir: ALT_DIR, kind: 'custom' }
+  ])
+  const p2Linked = await links.linkProject(p2.id, ['root-skill', 'plain-skill'], resolve)
+  if (p2Linked.links.length !== 4) throw new Error(`位点用例前置链接数错误: ${p2Linked.links.length}`)
+  // 停用 custom 位点：链接断开、位点保留且顺序不变
+  const p2Off = await links.setSites(
+    p2.id,
+    [
+      { dir: path.join(PROJECT2, '.claude', 'skills'), kind: 'claude' },
+      { dir: ALT_DIR, kind: 'custom', enabled: false }
+    ],
+    resolve
+  )
+  const altGone = !fs.existsSync(path.join(ALT_DIR, 'root-skill')) && !fs.existsSync(path.join(ALT_DIR, 'plain-skill'))
+  const expectedAlt = path.resolve(ALT_DIR)
+  const siteKept = p2Off.sites.length === 2 && path.resolve(p2Off.sites[1].dir) === expectedAlt && p2Off.sites[1].enabled === false
+  const uniqueOff = new Set(p2Off.links.map((l) => l.skillName)).size
+  const noAltRecords = !p2Off.links.some((l) => path.resolve(l.dir) === expectedAlt)
+  console.log('✓ 停用位点：链接断开 / 位置保留 / 唯一技能数 / 无停用位点记录:', altGone, siteKept, uniqueOff, noAltRecords)
+  if (!altGone || !siteKept || uniqueOff !== 2 || !noAltRecords) throw new Error('位点停用/去重逻辑错误')
+  // 停用状态下调用 linkProject：只写启用位点，不触碰停用位点
+  const p2Mid = await links.linkProject(p2.id, ['root-skill', 'plain-skill'], resolve, true)
+  const midAltAbsent =
+    !fs.existsSync(path.join(ALT_DIR, 'root-skill')) && !p2Mid.links.some((l) => path.resolve(l.dir) === expectedAlt)
+  const uniqueMid = new Set(p2Mid.links.map((l) => l.skillName)).size
+  console.log('✓ 停用期间 linkProject 只写启用位点，唯一技能数:', midAltAbsent, uniqueMid)
+  if (!midAltAbsent || uniqueMid !== 2) throw new Error('linkProject 未遵守启用位点')
+  // 重新启用（经 setSites 保存）：停用位点自动重建链接
+  const p2On = await links.setSites(
+    p2.id,
+    [
+      { dir: path.join(PROJECT2, '.claude', 'skills'), kind: 'claude' },
+      { dir: ALT_DIR, kind: 'custom', enabled: true }
+    ],
+    resolve
+  )
+  const altBack = fs.existsSync(path.join(ALT_DIR, 'root-skill')) && fs.existsSync(path.join(ALT_DIR, 'plain-skill'))
+  const uniqueOn = new Set(p2On.links.map((l) => l.skillName)).size
+  console.log('✓ 重新启用：位点自动重建整个技能集，唯一技能数:', altBack, uniqueOn)
+  if (!altBack || uniqueOn !== 2) throw new Error('位点重建逻辑错误')
+
+  // --- 旧数据剥离：项目里的全局位点直接断开移除 ---
+  const LEGACY = BASE + '/legacy-project'
+  const LEGACY2 = BASE + '/legacy-project-2'
+  fs.rmSync(LEGACY, { recursive: true, force: true })
+  fs.mkdirSync(LEGACY, { recursive: true })
+  fs.rmSync(LEGACY2, { recursive: true, force: true })
+  fs.mkdirSync(LEGACY2, { recursive: true })
+  // 先在全局位点放一条真实链接，模拟旧项目链接到了 ~/.agents/skills
+  await links.setGlobalSites([{ dir: GLOBAL_DIR, kind: 'global' }], resolve)
+  await links.linkGlobal(['root-skill'], resolve, true)
+  const legacyLinkPath = path.join(GLOBAL_DIR, 'root-skill')
+  const targetPath = await resolve('root-skill')
+  const realGlobalDir = normalizeDir('~/.agents/skills') // 真实用户主目录下的全局目录
+  // 覆盖 projects.json：一条带 global 位点（0.2.0 中间版）、一条无 sites 且 skillsDir 为全局目录（0.1.0 旧版）
+  fs.writeFileSync(
+    LINKS_DIR + '/projects.json',
+    JSON.stringify([
+      {
+        id: 'legacy-1',
+        name: 'legacy1',
+        path: LEGACY,
+        skillsDir: GLOBAL_DIR,
+        sites: [{ dir: GLOBAL_DIR, kind: 'global' }],
+        linkedAt: new Date().toISOString(),
+        links: [{ skillName: 'root-skill', dir: GLOBAL_DIR, linkPath: legacyLinkPath, targetPath, linkedAt: new Date().toISOString() }]
+      },
+      {
+        id: 'legacy-2',
+        name: 'legacy2',
+        path: LEGACY2,
+        skillsDir: realGlobalDir,
+        linkedAt: new Date().toISOString(),
+        links: []
+      }
+    ]),
+    'utf-8'
+  )
+  const afterLoad = await links.listProjects()
+  const legacy1 = afterLoad.find((x) => x.id === 'legacy-1')
+  const legacy2 = afterLoad.find((x) => x.id === 'legacy-2')
+  // legacy-1：global 位点被剥离（其下链接断开、记录清空），补默认项目级位点
+  const stripped =
+    legacy1 &&
+    legacy1.sites.length === 1 &&
+    legacy1.sites[0].kind === 'claude' &&
+    legacy1.links.length === 0 &&
+    !fs.existsSync(legacyLinkPath)
+  // legacy-2：旧版无 sites 且 skillsDir 指向全局目录 → 同样剥离并补默认项目级位点
+  const defaulted =
+    legacy2 && legacy2.sites.length === 1 && legacy2.sites[0].kind === 'claude' && legacy2.sites[0].dir !== realGlobalDir
+  console.log('✓ 旧全局位点剥离：链接断开 / global 位点移除 / 补默认项目级位点:', stripped, defaulted)
+  if (!stripped || !defaulted) throw new Error('旧全局位点未正确剥离')
+  // 全局配置本身不受影响（global 类型位点仍保留）
+  const gAfter = await links.getGlobalLinks()
+  const globalKindOk = gAfter.sites.length === 1 && gAfter.sites[0].kind === 'global'
+  console.log('✓ 全局位点仍可为 global 类型:', globalKindOk)
+  if (!globalKindOk) throw new Error('全局位点类型被误伤')
 
   console.log('\n✅ ALL E2E CHECKS PASSED')
 }

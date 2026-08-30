@@ -32,6 +32,13 @@ const trimTrailing = (p: string): string => p.trim().replace(/[\\/]+$/, '')
 const kindLabel = (kind: LinksSite['kind']): string =>
   kind === 'claude' ? '项目级' : kind === 'global' ? '全局' : '自定义'
 
+/** 唯一技能数：同一技能在多位置点下只计一次 */
+const uniqueCount = (links: { skillName: string }[]): number =>
+  new Set(links.map((l) => l.skillName)).size
+
+/** 启用位点数 */
+const enabledCount = (sites: LinksSite[]): number => sites.filter((s) => s.enabled !== false).length
+
 /** checkbox：支持半选态（indeterminate） */
 function GroupCheckbox({
   checked,
@@ -213,30 +220,28 @@ function SkillPickerModal({
   )
 }
 
-/** 位点目录列表（可移除） */
-function SiteChips({
-  sites,
-  onRemove
-}: {
-  sites: LinksSite[]
-  onRemove?: (dir: string) => void
-}): React.JSX.Element {
+/** 位点目录列表（只读展示，停用位点灰显且保留位置） */
+function SiteChips({ sites }: { sites: LinksSite[] }): React.JSX.Element {
   if (sites.length === 0) return <span className="muted" style={{ fontSize: 12 }}>（尚未添加位点目录）</span>
   return (
     <div className="link-chips" style={{ marginTop: 8 }}>
-      {sites.map((s) => (
-        <span key={s.dir} className="link-chip" title={`${kindLabel(s.kind)} · ${s.dir}`}>
-          <span className="src-badge" style={{ marginRight: 4, fontSize: 11 }}>
-            {kindLabel(s.kind)}
-          </span>
-          <span className="mono" style={{ fontSize: 12 }}>{s.dir}</span>
-          {onRemove && (
-            <span className="x" onClick={() => onRemove(s.dir)} title="移除位点">
-              ✕
+      {sites.map((s) => {
+        const enabled = s.enabled !== false
+        return (
+          <span
+            key={s.dir}
+            className="link-chip"
+            title={`${kindLabel(s.kind)} · ${s.dir}${enabled ? '' : ' · 已停用（保留位置）'}`}
+            style={enabled ? undefined : { opacity: 0.55 }}
+          >
+            <span className="src-badge" style={{ marginRight: 4, fontSize: 11 }}>
+              {kindLabel(s.kind)}
             </span>
-          )}
-        </span>
-      ))}
+            <span className="mono" style={{ fontSize: 12 }}>{s.dir}</span>
+            {!enabled && <span className="muted" style={{ marginLeft: 4, fontSize: 11 }}>停用中</span>}
+          </span>
+        )
+      })}
     </div>
   )
 }
@@ -254,6 +259,8 @@ export function ProjectsPage({ projects, skills, groups, global, onChanged }: Pr
   const [siteModal, setSiteModal] = useState<SiteModalState>(null)
   const [modalPath, setModalPath] = useState('')
   const [siteDirs, setSiteDirs] = useState<LinksSite[]>([])
+  // 添加位点时的类型下拉（项目模式：claude/custom；全局模式：global/custom）
+  const [addKind, setAddKind] = useState<'claude' | 'global' | 'custom'>('claude')
   const [customInput, setCustomInput] = useState<string>(
     () => localStorage.getItem(LAST_CUSTOM_DIR_KEY) ?? ''
   )
@@ -272,19 +279,32 @@ export function ProjectsPage({ projects, skills, groups, global, onChanged }: Pr
         ? [{ dir: trimTrailing(prefill || pathInput) + '\\' + '.claude' + '\\' + 'skills', kind: 'claude' }]
         : []
     )
+    setAddKind('claude')
     setSiteModal({ mode: 'add' })
   }
 
   const openManageSites = (project: ProjectRecord): void => {
     setModalPath(project.path)
     setSiteDirs(project.sites.map((s) => ({ ...s })))
+    setAddKind('claude')
     setSiteModal({ mode: 'manage', project })
   }
 
   const openGlobalSites = (): void => {
     setModalPath('')
     setSiteDirs((global?.sites ?? []).map((s) => ({ ...s })))
+    setAddKind('global')
     setSiteModal({ mode: 'global' })
+  }
+
+  /** 切换位点启用/停用（仅改 enabled，保留位置） */
+  const toggleSiteEnabled = (dir: string): void => {
+    setSiteDirs((prev) => prev.map((s) => (s.dir === dir ? { ...s, enabled: s.enabled === false } : s)))
+  }
+
+  /** 删除位点（显式移除） */
+  const removeSite = (dir: string): void => {
+    setSiteDirs((prev) => prev.filter((s) => s.dir !== dir))
   }
 
   /** 去重后加入一个位点 */
@@ -315,6 +335,19 @@ export function ProjectsPage({ projects, skills, groups, global, onChanged }: Pr
     } else {
       addSite({ dir: '~/.agents/skills', kind: 'global' })
     }
+  }
+
+  /** 按当前下拉类型添加位点 */
+  const addBySelect = (): void => {
+    if (addKind === 'custom') {
+      addCustom()
+      return
+    }
+    if (addKind === 'global') {
+      addSite({ dir: '~/.agents/skills', kind: 'global' })
+      return
+    }
+    addPreset('claude')
   }
 
   /** 自定义目录：输入添加或多个目录浏览添加 */
@@ -355,10 +388,10 @@ export function ProjectsPage({ projects, skills, groups, global, onChanged }: Pr
         push(`已添加项目 ${record.name}（${record.sites.length} 个位点目录）`)
       } else if (siteModal.mode === 'manage') {
         const record = await window.trove.setProjectSites(siteModal.project.id, siteDirs)
-        push(`已更新位点：${record.sites.length} 个目录，保留 ${record.links.length} 个链接`)
+        push(`已更新位点：${enabledCount(record.sites)}/${record.sites.length} 启用，保留 ${uniqueCount(record.links)} 个技能链接`)
       } else {
         const config = await window.trove.setGlobalSites(siteDirs)
-        push(`已更新全局位点：${config.sites.length} 个目录，保留 ${config.links.length} 个链接`)
+        push(`已更新全局位点：${enabledCount(config.sites)}/${config.sites.length} 启用，保留 ${uniqueCount(config.links)} 个技能链接`)
       }
       closeSiteModal()
       setPathInput('')
@@ -380,7 +413,7 @@ export function ProjectsPage({ projects, skills, groups, global, onChanged }: Pr
     setBusy('link')
     try {
       const record = await window.trove.linkSkills(manageId, [...selectedSkills], true)
-      push(`已保存链接：当前 ${record.links.length} 个技能`)
+      push(`已保存链接：当前 ${uniqueCount(record.links)} 个技能`)
       setManageId(null)
       onChanged()
     } catch (e) {
@@ -394,7 +427,7 @@ export function ProjectsPage({ projects, skills, groups, global, onChanged }: Pr
     setBusy('globallink')
     try {
       const config = await window.trove.linkGlobal([...globalSelected], true)
-      push(`已保存全局链接：当前 ${config.links.length} 个技能`)
+      push(`已保存全局链接：当前 ${uniqueCount(config.links)} 个技能`)
       setGlobalManage(false)
       onChanged()
     } catch (e) {
@@ -467,7 +500,7 @@ export function ProjectsPage({ projects, skills, groups, global, onChanged }: Pr
           <span className="name">全局链接</span>
           <span className="muted mono">{global?.sites[0]?.dir ?? '~/.agents/skills'}</span>
           <span className="src-badge" style={{ marginLeft: 'auto' }}>
-            {global?.links.length ?? 0} 个技能
+            {global ? uniqueCount(global.links) : 0} 个技能
           </span>
           <button className="btn small" onClick={() => openGlobalSites()} title="管理全局链接位点目录">
             管理位点
@@ -485,7 +518,7 @@ export function ProjectsPage({ projects, skills, groups, global, onChanged }: Pr
         </div>
         <div className="muted" style={{ fontSize: 12.5, marginBottom: 6 }}>
           全局位点：{global?.sites.map((s) => s.dir).join('、') ?? '~/.agents/skills'}
-          （一套技能集同时链接到这些目录，所有项目 / Agent 共用；断开即移除该技能）
+          （启用 {global ? enabledCount(global.sites) : 0}/{global?.sites.length ?? 0}；一套技能集同时链接到这些目录，所有项目 / Agent 共用；断开即移除该技能）
         </div>
         {!global || global.links.length === 0 ? (
           <div className="muted" style={{ fontSize: 13 }}>
@@ -524,7 +557,7 @@ export function ProjectsPage({ projects, skills, groups, global, onChanged }: Pr
                 <span className="name">{p.name}</span>
                 <span className="muted mono">{p.path}</span>
                 <span className="src-badge" style={{ marginLeft: 'auto' }}>
-                  {linked.length} 个技能
+                  {uniqueCount(linked)} 个技能
                 </span>
                 <button className="btn small" onClick={() => openManager(p)}>
                   管理链接
@@ -558,13 +591,9 @@ export function ProjectsPage({ projects, skills, groups, global, onChanged }: Pr
               </div>
 
               <div className="muted" style={{ fontSize: 12.5, marginBottom: 6 }}>
-                {p.sites.length > 1 ? '链接位点：' : '链接目录：'}
-                {p.sites.length > 1 ? (
-                  <span className="mono">{p.sites.map((s) => s.dir).join('、')}</span>
-                ) : (
-                  <span className="mono">{p.skillsDir}</span>
-                )}
-                （Agent 从这些目录读取技能，内容为指向主库的链接，主库更新自动同步）
+                链接位点（启用 {enabledCount(p.sites)}/{p.sites.length}）：
+                <span className="mono">{p.sites.map((s) => s.dir).join('、')}</span>
+                （Agent 从这些启用目录读取技能，内容为指向主库的链接，主库更新自动同步；取消勾选的位点停用但保留）
               </div>
               <SiteChips sites={p.sites} />
 
@@ -678,45 +707,98 @@ export function ProjectsPage({ projects, skills, groups, global, onChanged }: Pr
           )}
 
           <div className="field">
-            <label>位点目录（Agent 从这些目录读取技能，可多条；技能集链接到全部位点）</label>
-            <SiteChips sites={siteDirs} onRemove={(dir) => setSiteDirs((prev) => prev.filter((s) => s.dir !== dir))} />
+            <label>位点目录（勾选=启用，取消勾选=停用但保留位置；技能集只链接到启用位点）</label>
+            {siteDirs.length === 0 ? (
+              <span className="muted" style={{ fontSize: 12 }}>（尚未添加位点目录）</span>
+            ) : (
+              <div className="check-list" style={{ marginTop: 8 }}>
+                {siteDirs.map((s) => {
+                  const enabled = s.enabled !== false
+                  return (
+                    <label
+                      key={s.dir}
+                      className="check-item"
+                      style={{ display: 'flex', alignItems: 'center', gap: 8 }}
+                      title={enabled ? '勾选中：该位点参与链接' : '已停用：链接已断开，重新勾选即恢复'}
+                    >
+                      <input type="checkbox" checked={enabled} onChange={() => toggleSiteEnabled(s.dir)} />
+                      <span className="src-badge" style={{ fontSize: 11 }}>
+                        {kindLabel(s.kind)}
+                      </span>
+                      <span
+                        className="mono"
+                        style={{ fontSize: 12, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                      >
+                        {s.dir}
+                      </span>
+                      {!enabled && <span className="muted" style={{ fontSize: 11 }}>停用中</span>}
+                      <button className="btn small danger" onClick={() => removeSite(s.dir)}>
+                        删除
+                      </button>
+                    </label>
+                  )
+                })}
+              </div>
+            )}
             <div className="settings-row" style={{ marginTop: 8, marginBottom: 0 }}>
-              <label className="preset-radio">
-                <input type="checkbox" onChange={() => addPreset('claude')} disabled={siteModal.mode === 'global'} />
-                Claude Code 项目级
-                <span className="muted mono"> 项目/.claude/skills</span>
-              </label>
-              <label className="preset-radio">
-                <input type="checkbox" onChange={() => addPreset('global')} />
-                全局用户级
-                <span className="muted mono"> ~/.agents/skills</span>
-              </label>
-            </div>
-            <div className="settings-row" style={{ marginTop: 6, marginBottom: 0 }}>
-              <input
-                className="input mono"
-                value={customInput}
-                onChange={(e) => setCustomInput(e.target.value)}
-                placeholder="自定义目录（可记忆），如 D:\\xxx\\.cursor\\skills"
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') addCustom()
-                }}
-              />
-              <button className="btn" onClick={addCustom}>
-                添加
-              </button>
-              <button className="btn" onClick={() => void browseCustom()}>
-                浏览（多选）…
-              </button>
+              <select
+                className="input"
+                value={addKind}
+                onChange={(e) => setAddKind(e.target.value as 'claude' | 'global' | 'custom')}
+                style={{ maxWidth: 300 }}
+                title="选择要添加的位点类型"
+              >
+                {siteModal.mode === 'global' ? (
+                  <>
+                    <option value="global">全局用户级（~/.agents/skills）</option>
+                    <option value="custom">自定义目录</option>
+                  </>
+                ) : (
+                  <>
+                    <option value="claude">Claude Code 项目级（项目/.claude/skills）</option>
+                    <option value="custom">自定义目录</option>
+                  </>
+                )}
+              </select>
+              {addKind === 'custom' ? (
+                <>
+                  <input
+                    className="input mono"
+                    value={customInput}
+                    onChange={(e) => setCustomInput(e.target.value)}
+                    placeholder="自定义目录（可记忆），如 D:\\xxx\\.cursor\\skills"
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') addCustom()
+                    }}
+                  />
+                  <button className="btn" onClick={addCustom}>
+                    添加
+                  </button>
+                  <button className="btn" onClick={() => void browseCustom()}>
+                    浏览（多选）…
+                  </button>
+                </>
+              ) : (
+                <>
+                  <span className="muted mono" style={{ fontSize: 12 }}>
+                    {addKind === 'claude'
+                      ? modalPath.trim()
+                        ? trimTrailing(modalPath) + '\\.claude\\skills'
+                        : '（待填写项目路径后可用）'
+                      : '~/.agents/skills'}
+                  </span>
+                  <button className="btn" onClick={addBySelect}>
+                    添加
+                  </button>
+                </>
+              )}
             </div>
           </div>
           <div className="settings-hint">
-            <b>项目级</b>：<span className="mono">.claude/skills</span>（Claude Code 直接识别）；<b>全局</b>：
-            <span className="mono">~/.agents/skills</span>（遵守该约定的 Agent 都能读到，所有项目共用）；
-            自定义：任意目录（如 Cursor 的 <span className="mono">.cursor/skills</span>）。
+            取消勾选仅停用该位点（位置保留），其下链接断开，重新勾选即自动恢复链接。
             {siteModal.mode === 'global'
-              ? '全局位点建议只留全局用户级或自定义目录。'
-              : '多个位点时，一次勾选的技能集会同时链接到所有位点目录。'}
+              ? ' 全局位点：全局用户级（~/.agents/skills）或自定义目录；全局技能对所有项目生效。'
+              : ' 项目位点仅项目级：Claude Code 项目级（.claude/skills）或自定义目录；全局类型的技能请到「全局链接」中管理。'}
           </div>
         </Modal>
       )}

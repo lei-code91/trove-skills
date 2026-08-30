@@ -24,6 +24,68 @@ interface GroupedSection {
   skills: SkillInfo[]
 }
 
+/** 更新结果明细弹窗：已更新 / 已是最新 / 失败 三区 */
+function UpdateResultModal({
+  title,
+  results,
+  onClose
+}: {
+  title: string
+  results: { name: string; ok: boolean; message: string }[]
+  onClose: () => void
+}): React.JSX.Element {
+  const updated = results.filter((r) => r.ok && r.message === '已更新')
+  const latest = results.filter((r) => r.ok && r.message.includes('已是最新'))
+  const failed = results.filter((r) => !r.ok)
+  const chipList = (items: { name: string }[], emptyText: string): React.JSX.Element =>
+    items.length === 0 ? (
+      <div className="muted" style={{ fontSize: 13 }}>{emptyText}</div>
+    ) : (
+      <div className="link-chips">
+        {items.map((i) => (
+          <span key={i.name} className="link-chip">
+            {i.name}
+          </span>
+        ))}
+      </div>
+    )
+  return (
+    <Modal
+      title={`更新结果 · ${title}`}
+      onClose={onClose}
+      width={540}
+      footer={
+        <button className="btn primary" onClick={onClose}>
+          关闭
+        </button>
+      }
+    >
+      <div className="settings-hint" style={{ marginBottom: 4 }}>
+        <b>已更新（{updated.length}）</b>
+      </div>
+      {chipList(updated, '无')}
+      <div className="settings-hint" style={{ marginTop: 10, marginBottom: 4 }}>
+        <b>已是最新（{latest.length}）</b>
+      </div>
+      {chipList(latest, '无')}
+      <div className="settings-hint" style={{ marginTop: 10, marginBottom: 4 }}>
+        <b>失败（{failed.length}）</b>
+      </div>
+      {failed.length === 0 ? (
+        <div className="muted" style={{ fontSize: 13 }}>无</div>
+      ) : (
+        <div>
+          {failed.map((f) => (
+            <div key={f.name} className="err-box" style={{ marginBottom: 6 }}>
+              <b>{f.name}</b>：{f.message}
+            </div>
+          ))}
+        </div>
+      )}
+    </Modal>
+  )
+}
+
 export function LibraryPage({ skills, groups, settings, onChanged }: Props): React.JSX.Element {
   const { push } = useToast()
   const [query, setQuery] = useState('')
@@ -48,6 +110,11 @@ export function LibraryPage({ skills, groups, settings, onChanged }: Props): Rea
   const [readmeZh, setReadmeZh] = useState<string | null>(null)
   const [showZh, setShowZh] = useState(false)
   const [translateBusy, setTranslateBusy] = useState(false)
+  // 更新结果明细（全部更新 / 分组更新共用）
+  const [updateResult, setUpdateResult] = useState<{
+    title: string
+    results: { name: string; ok: boolean; message: string }[]
+  } | null>(null)
 
   // 切换选中技能时重置翻译状态
   useEffect(() => {
@@ -159,26 +226,63 @@ export function LibraryPage({ skills, groups, settings, onChanged }: Props): Rea
     }
   }
 
+  /** 执行批量更新并弹出结果明细（全部更新 / 分组更新共用） */
+  const runUpdate = async (title: string, busyKey: string, gitSkills: SkillInfo[]): Promise<void> => {
+    setBusy(busyKey)
+    try {
+      const res = await window.trove.updateSkills(gitSkills)
+      setUpdateResult({ title, results: res })
+      const updated = res.filter((r) => r.ok && r.message === '已更新').length
+      const upToDate = res.filter((r) => r.ok && r.message.includes('已是最新')).length
+      const failed = res.filter((r) => !r.ok).length
+      if (failed === 0) push(`更新完成：${updated} 个更新，${upToDate} 个最新`)
+      else push(`更新完成：${updated} 个更新，${upToDate} 个最新，${failed} 个失败（详见明细）`, 'err')
+      onChanged()
+    } catch (e) {
+      push(e instanceof Error ? e.message : String(e), 'err')
+    } finally {
+      setBusy(null)
+    }
+  }
+
   /** 一键更新整个分组（同仓库所有 git 技能，仓库只克隆一次） */
   const updateGroupAll = async (sec: GroupedSection): Promise<void> => {
     const gitSkills = sec.skills.filter((s) => s.source?.kind === 'git')
     if (gitSkills.length === 0) return
-    setBusy('upd-' + sec.key)
+    await runUpdate(`「${sec.name}」`, 'upd-' + sec.key, gitSkills)
+  }
+
+  /** 一键全部更新：更新主库所有 Git 来源技能（主进程按仓库分组、每仓库只克隆一次） */
+  const updateAll = async (): Promise<void> => {
+    const gitSkills = skills.filter((s) => s.source?.kind === 'git')
+    if (gitSkills.length === 0) {
+      push('没有可更新的 Git 来源技能', 'err')
+      return
+    }
+    await runUpdate('全部更新', 'upd-all', gitSkills)
+  }
+
+  /** 批量生成中文描述（LLM）：勾选的技能逐个生成，跳过已有中文描述 */
+  const batchZh = async (): Promise<void> => {
+    const names = [...checked]
+    if (names.length === 0) return
+    if (!settings?.activeLlmProfileId) {
+      push('未配置 LLM：请先在「设置」中添加并启用一个 LLM 配置', 'err')
+      return
+    }
+    const targets = skills.filter((s) => names.includes(s.name))
+    setBusy('batchzh')
     try {
-      const res = await window.trove.updateSkills(gitSkills)
+      const res = await window.trove.batchSummarizeZh(targets)
+      const ok = res.filter((r) => r.ok)
+      const skipped = ok.filter((r) => r.message.includes('跳过')).length
       const failed = res.filter((r) => !r.ok)
-      const upToDate = res.filter((r) => r.ok && r.message.includes('已是最新')).length
-      const updated = res.filter((r) => r.ok && !r.message.includes('已是最新')).length
-      if (failed.length === 0) {
-        if (updated === 0 && upToDate > 0) push(`「${sec.name}」全部 ${res.length} 个技能均已是最新，无需更新`)
-        else if (upToDate === 0) push(`「${sec.name}」全部 ${res.length} 个技能已更新`)
-        else push(`「${sec.name}」${updated} 个已更新，${upToDate} 个已是最新`)
-      } else if (failed.length === res.length)
-        push(`更新失败：${failed.map((f) => f.message).join('；')}`, 'err')
-      else
-        push(`「${sec.name}」${updated} 个已更新，${upToDate} 个已是最新，${failed.length} 个失败：${failed
-          .map((f) => f.message)
-          .join('；')}`)
+      const gen = ok.length - skipped
+      push(
+        `已生成中文描述 ${gen} 个${skipped > 0 ? `，跳过已有 ${skipped} 个` : ''}` +
+          (failed.length > 0 ? `；${failed.length} 个失败：${failed.map((f) => f.name).join('、')}` : '')
+      )
+      setChecked(new Set())
       onChanged()
     } catch (e) {
       push(e instanceof Error ? e.message : String(e), 'err')
@@ -369,6 +473,14 @@ export function LibraryPage({ skills, groups, settings, onChanged }: Props): Rea
         <div className="page-head">
         <h2>技能库</h2>
         <div className="actions">
+          <button
+            className="btn"
+            onClick={() => void updateAll()}
+            disabled={busy === 'upd-all' || !skills.some((s) => s.source?.kind === 'git')}
+            title="一键更新主库全部 Git 来源技能"
+          >
+            {busy === 'upd-all' ? <Spinner /> : null} 🔄 全部更新
+          </button>
           <button className="btn" onClick={() => setShowDraft(true)} disabled={!settings?.activeLlmProfileId}>
             ✨ AI 创建
           </button>
@@ -423,6 +535,14 @@ export function LibraryPage({ skills, groups, settings, onChanged }: Props): Rea
         {checked.size > 0 && (
           <div className="batch-bar">
             <span>已勾选 <b>{checked.size}</b> 个技能</span>
+            <button
+              className="btn small"
+              disabled={busy === 'batchzh' || !settings?.activeLlmProfileId}
+              title={settings?.activeLlmProfileId ? '为勾选技能批量生成中文描述（跳过已有）' : '需先在设置中配置并启用 LLM'}
+              onClick={() => void batchZh()}
+            >
+              {busy === 'batchzh' ? <Spinner /> : null} 🌏 批量中文描述
+            </button>
             <button
               className="btn small danger"
               disabled={busy === 'batch'}
@@ -842,6 +962,14 @@ export function LibraryPage({ skills, groups, settings, onChanged }: Props): Rea
             autoFocus
           />
         </Modal>
+      )}
+
+      {updateResult && (
+        <UpdateResultModal
+          title={updateResult.title}
+          results={updateResult.results}
+          onClose={() => setUpdateResult(null)}
+        />
       )}
     </div>
   )

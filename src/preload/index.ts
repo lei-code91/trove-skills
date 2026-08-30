@@ -68,6 +68,10 @@ const api = {
     ipcRenderer.invoke('skills:batchUninstall', names),
   setSkillZh: (name: string, descriptionZh: string): Promise<void> =>
     ipcRenderer.invoke('skills:setZh', name, descriptionZh),
+  batchSummarizeZh: (
+    skills: SkillInfo[]
+  ): Promise<{ name: string; ok: boolean; message: string }[]> =>
+    ipcRenderer.invoke('skills:batchSummarizeZh', skills),
   removeGroup: (url: string): Promise<string[]> =>
     ipcRenderer.invoke('groups:remove', url),
   setGroupNote: (url: string, note: string): Promise<void> =>

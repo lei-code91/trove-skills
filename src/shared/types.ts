@@ -87,6 +87,8 @@ export interface LinksSite {
   kind: 'claude' | 'global' | 'custom'
   /** 可选显示名 */
   label?: string
+  /** 是否启用；取消勾选仅停用（保留位置），缺省视为启用 */
+  enabled?: boolean
 }
 
 /** 项目记录：项目文件夹 + 链接到库的技能（可含多条位点目录） */
