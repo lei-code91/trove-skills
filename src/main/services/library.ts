@@ -4,6 +4,10 @@ import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 import type { LibrarySnapshot, RepoGroup, SkillInfo, SkillSource, SkillStatus } from '@shared/types'
 
 const SKILL_FILE = 'SKILL.md'
+/** 本地导入技能的固定分组目录名 */
+const LOCAL_GROUP_DIR = '_local'
+/** AI 生成技能的固定分组目录名 */
+const AI_GROUP_DIR = '_ai'
 
 interface SkillMeta {
   status: SkillStatus
@@ -29,8 +33,9 @@ function migrateIndex(data: unknown): LibraryIndex {
 
 /**
  * 技能库管理器：主库目录（trove）是唯一权威来源。
- * - 一个技能 = skillsDir 下的一级子目录，包含 SKILL.md
+ * - 一个技能 = skillsDir/分组目录/技能目录，包含 SKILL.md（分组目录是仓库或本地/AI 的容器）
  * - 状态/来源元数据存索引文件（不依赖标记文件，用户手动改动目录也能识别）
+ * - 布局变更：旧版扁平的 skillsDir/技能目录 会在 scan 时自动迁移进分组目录
  */
 export class LibraryManager {
   constructor(
@@ -53,6 +58,85 @@ export class LibraryManager {
     await fs.writeFile(tmp, JSON.stringify({ skills: index.skills, groups: index.groups }, null, 2), 'utf-8')
     await fs.rename(tmp, this.indexFile)
   }
+
+  // ---------- 分组目录定位 ----------
+
+  /** 来源对应的分组目录名：git 用仓库短名，本地/AI 用固定分组 */
+  private groupDirOf(index: LibraryIndex, source?: SkillSource): string | undefined {
+    if (!source) return undefined
+    if (source.kind === 'git' && source.url) {
+      return index.groups[source.url]?.dir ?? sanitizeName(shortNameOf(source.url))
+    }
+    if (source.kind === 'ai') return AI_GROUP_DIR
+    return LOCAL_GROUP_DIR
+  }
+
+  /** 推导主库根下技能目录：分组目录 + 技能名；无法推导返回 undefined */
+  private destFromIndex(
+    root: string,
+    index: LibraryIndex,
+    name: string,
+    source?: SkillSource
+  ): string | undefined {
+    const groupDir = this.groupDirOf(index, source ?? index.skills[name]?.source)
+    if (!groupDir) return undefined
+    return path.join(root, groupDir, name)
+  }
+
+  /** 为仓库 url 分配分组目录名：优先复用已有 dir，否则按短名推导并处理冲突（-2、-3…） */
+  private async ensureGroupDir(
+    root: string,
+    index: LibraryIndex,
+    url: string,
+    repoName: string
+  ): Promise<string> {
+    const prev = index.groups[url]
+    if (prev?.dir) return prev.dir
+    const used = new Set<string>(
+      Object.values(index.groups)
+        .map((g) => g.dir)
+        .filter((x): x is string => !!x)
+    )
+    const base = sanitizeName(repoName)
+    let candidate = base
+    let i = 2
+    const isFree = async (name: string): Promise<boolean> =>
+      !used.has(name) && !(await exists(path.join(root, name)))
+    while (!(await isFree(candidate))) candidate = `${base}-${i++}`
+    index.groups[url] = {
+      ...(prev ?? { url, name: repoName, description: '', installedAt: new Date().toISOString() }),
+      dir: candidate
+    }
+    return candidate
+  }
+
+  /** 查找技能实际目录：优先索引推导，其次一级旧目录，再全盘搜索分组目录 */
+  private async locateSkillDir(name: string): Promise<string | null> {
+    const root = await this.skillsDir()
+    const direct = path.join(root, name)
+    if (await exists(direct)) return direct
+    const index = await this.getIndex()
+    const fromIndex = this.destFromIndex(root, index, name)
+    if (fromIndex && (await exists(fromIndex))) return fromIndex
+    return this.findSkillDir(root, name)
+  }
+
+  /** 全盘搜索：遍历所有分组目录找同名技能目录 */
+  private async findSkillDir(root: string, name: string): Promise<string | null> {
+    let entries: import('fs').Dirent[] = []
+    try {
+      entries = await fs.readdir(root, { withFileTypes: true })
+    } catch {
+      return null
+    }
+    for (const d of entries.filter((e) => e.isDirectory())) {
+      const candidate = path.join(root, d.name, name)
+      if (await exists(candidate)) return candidate
+    }
+    return null
+  }
+
+  // ---------- 解析 / 扫描 ----------
 
   /** 解析一个技能目录，返回 SkillInfo；不是有效技能（无 SKILL.md）返回 null */
   async parseSkillDir(dir: string): Promise<SkillInfo | null> {
@@ -98,51 +182,96 @@ export class LibraryManager {
     }
   }
 
-  /** 扫描主库：技能列表 + 仓库分组（快照） */
+  /** 判断一级目录是否为分组容器：固定分组名 / 索引登记的分组目录名 / 含 SKILL.md 子目录 */
+  private async looksLikeGroupDir(index: LibraryIndex, name: string, dirPath: string): Promise<boolean> {
+    if (name === LOCAL_GROUP_DIR || name === AI_GROUP_DIR) return true
+    if (Object.values(index.groups).some((g) => g.dir === name)) return true
+    let children: import('fs').Dirent[] = []
+    try {
+      children = await fs.readdir(dirPath, { withFileTypes: true })
+    } catch {
+      return false
+    }
+    for (const c of children.filter((e) => e.isDirectory())) {
+      if (await exists(path.join(dirPath, c.name, SKILL_FILE))) return true
+    }
+    return false
+  }
+
+  /** 扫描主库：先迁移旧扁平布局，再按「分组目录 → 技能目录」两层扫描 */
   async scan(): Promise<LibrarySnapshot> {
-    const dir = await this.skillsDir()
-    await fs.mkdir(dir, { recursive: true })
-    const index = await this.getIndex()
+    const root = await this.skillsDir()
+    await fs.mkdir(root, { recursive: true })
+    let index = await this.getIndex()
+    index = await this.migrateLegacyLayout(root, index)
     let entries: import('fs').Dirent[] = []
     try {
-      entries = await fs.readdir(dir, { withFileTypes: true })
+      entries = await fs.readdir(root, { withFileTypes: true })
     } catch {
       return { skills: [], groups: [] }
     }
     const dirs = entries.filter((e) => e.isDirectory())
     const result: SkillInfo[] = []
     for (const d of dirs) {
-      const info = await this.parseSkillDir(path.join(dir, d.name))
-      if (!info) {
-        result.push({
-          name: d.name,
-          title: d.name,
-          description: '',
-          tags: [],
-          status: 'broken',
-          path: path.join(dir, d.name),
-          frontmatter: {},
-          readme: '',
-          files: [],
-          updatedAt: ''
-        })
+      const dirPath = path.join(root, d.name)
+      if (!(await this.looksLikeGroupDir(index, d.name, dirPath))) {
+        // 一级技能目录（迁移失败/手动放入/损坏目录）
+        const info = await this.parseSkillDir(dirPath)
+        if (info) {
+          this.applyMeta(index, info)
+          result.push(info)
+        } else {
+          result.push(this.brokenInfo(dirPath))
+        }
         continue
       }
-      const meta = index.skills[info.name]
-      if (meta) {
-        info.status = meta.status
-        info.source = meta.source
-        if (typeof meta.descriptionZh === 'string' && meta.descriptionZh.trim()) {
-          info.descriptionZh = meta.descriptionZh
-        }
-      } else {
-        info.source = { kind: 'local', installedAt: info.updatedAt }
+      let children: import('fs').Dirent[] = []
+      try {
+        children = await fs.readdir(dirPath, { withFileTypes: true })
+      } catch {
+        continue
       }
-      result.push(info)
+      for (const c of children.filter((e) => e.isDirectory())) {
+        const skillPath = path.join(dirPath, c.name)
+        const info = await this.parseSkillDir(skillPath)
+        if (!info) continue
+        this.applyMeta(index, info)
+        result.push(info)
+      }
     }
     // 技能名排序（中文按拼音近似，用 localeCompare）
     result.sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN'))
     return { skills: result, groups: this.groupsFromIndex(index) }
+  }
+
+  /** 把索引元数据（状态 / 来源 / 中文描述）补到解析结果上；无索引记录时标记为本地来源 */
+  private applyMeta(index: LibraryIndex, info: SkillInfo): void {
+    const meta = index.skills[info.name]
+    if (meta) {
+      info.status = meta.status
+      info.source = meta.source
+      if (typeof meta.descriptionZh === 'string' && meta.descriptionZh.trim()) {
+        info.descriptionZh = meta.descriptionZh
+      }
+    } else {
+      info.source = { kind: 'local', installedAt: info.updatedAt }
+    }
+  }
+
+  private brokenInfo(dirPath: string): SkillInfo {
+    const name = path.basename(dirPath)
+    return {
+      name,
+      title: name,
+      description: '',
+      tags: [],
+      status: 'broken',
+      path: dirPath,
+      frontmatter: {},
+      readme: '',
+      files: [],
+      updatedAt: ''
+    }
   }
 
   /** 全部仓库分组（按短名排序） */
@@ -174,14 +303,15 @@ export class LibraryManager {
     }
   }
 
-  /** 仓库分组：删除整组（卸载组内全部技能目录 + 移除分组元数据） */
+  /** 仓库分组：删除整组（卸载组内全部技能目录 + 移除分组元数据与空分组目录） */
   async removeGroup(url: string): Promise<string[]> {
-    const dir = await this.skillsDir()
+    const root = await this.skillsDir()
     const removed: string[] = []
     const index = await this.getIndex()
+    const groupDir = index.groups[url]?.dir
     for (const [name, meta] of Object.entries(index.skills)) {
       if (meta.source?.url === url) {
-        const dest = path.join(dir, name)
+        const dest = groupDir ? path.join(root, groupDir, name) : path.join(root, name)
         if (await exists(dest)) {
           await fs.rm(dest, { recursive: true, force: true })
         }
@@ -190,6 +320,9 @@ export class LibraryManager {
       }
     }
     delete index.groups[url]
+    if (groupDir) {
+      await fs.rm(path.join(root, groupDir), { recursive: false, force: true }).catch(() => {})
+    }
     await this.saveIndex(index)
     return removed
   }
@@ -206,20 +339,26 @@ export class LibraryManager {
     }
   }
 
-  /** 安装：将临时目录中的技能目录复制进主库（不含 .git） */
+  /** 安装：将临时目录中的技能目录复制进主库分组目录（不含 .git） */
   async install(
     srcDir: string,
     name: string,
     source: SkillSource
   ): Promise<SkillInfo> {
-    const dir = await this.skillsDir()
-    await fs.mkdir(dir, { recursive: true })
-    const dest = path.join(dir, name)
+    const root = await this.skillsDir()
+    await fs.mkdir(root, { recursive: true })
+    const index = await this.getIndex()
+    const groupDir =
+      source.kind === 'git' && source.url
+        ? await this.ensureGroupDir(root, index, source.url, shortNameOf(source.url))
+        : source.kind === 'ai'
+          ? AI_GROUP_DIR
+          : LOCAL_GROUP_DIR
+    const dest = path.join(root, groupDir, name)
     if (await exists(dest)) {
       throw new Error(`技能 ${name} 已存在于主库（${dest}），请先卸载或用其它名字`)
     }
     await copyDir(srcDir, dest)
-    const index = await this.getIndex()
     index.skills[name] = { status: 'installed', source }
     await this.saveIndex(index)
     const info = await this.parseSkillDir(dest)
@@ -229,16 +368,23 @@ export class LibraryManager {
     return info
   }
 
-  /** 更新：先删除旧目录再整体替换 */
+  /** 更新：先删除旧目录再整体替换（旧扁平位置也兼容，写回分组目录） */
   async update(name: string, srcDir: string, source: SkillSource): Promise<SkillInfo> {
-    const dir = await this.skillsDir()
-    const dest = path.join(dir, name)
-    if (!(await exists(dest))) {
+    const root = await this.skillsDir()
+    const index = await this.getIndex()
+    const current = await this.locateSkillDir(name)
+    if (!current) {
       throw new Error(`技能 ${name} 不在主库中，无法更新`)
     }
-    await fs.rm(dest, { recursive: true, force: true })
+    await fs.rm(current, { recursive: true, force: true })
+    const groupDir =
+      source.kind === 'git' && source.url
+        ? await this.ensureGroupDir(root, index, source.url, shortNameOf(source.url))
+        : source.kind === 'ai'
+          ? AI_GROUP_DIR
+          : LOCAL_GROUP_DIR
+    const dest = path.join(root, groupDir, name)
     await copyDir(srcDir, dest)
-    const index = await this.getIndex()
     const prev = index.skills[name]
     index.skills[name] = { status: prev?.status ?? 'installed', source }
     await this.saveIndex(index)
@@ -250,17 +396,23 @@ export class LibraryManager {
   }
 
   async uninstall(name: string): Promise<void> {
-    const dir = await this.skillsDir()
-    const dest = path.join(dir, name)
-    if (!(await exists(dest))) throw new Error(`技能 ${name} 不在主库中`)
+    const root = await this.skillsDir()
+    const dest = await this.locateSkillDir(name)
+    if (!dest) throw new Error(`技能 ${name} 不在主库中`)
     await fs.rm(dest, { recursive: true, force: true })
     const index = await this.getIndex()
     const url = index.skills[name]?.source?.url
     delete index.skills[name]
-    // 组内最后一个技能被卸载时，移除空组
+    // 组内最后一个技能被卸载时，移除空组与空分组目录
     if (url) {
       const stillHas = Object.values(index.skills).some((m) => m.source?.url === url)
-      if (!stillHas) delete index.groups[url]
+      if (!stillHas) {
+        const groupDir = index.groups[url]?.dir
+        delete index.groups[url]
+        if (groupDir) {
+          await fs.rm(path.join(root, groupDir), { recursive: false, force: true }).catch(() => {})
+        }
+      }
     }
     await this.saveIndex(index)
   }
@@ -273,16 +425,15 @@ export class LibraryManager {
   }
 
   async resolveSkillDir(name: string): Promise<string> {
-    const dir = await this.skillsDir()
-    const dest = path.join(dir, name)
-    if (!(await exists(dest))) throw new Error(`技能 ${name} 不在主库中`)
+    const dest = await this.locateSkillDir(name)
+    if (!dest) throw new Error(`技能 ${name} 不在主库中`)
     return dest
   }
 
   /** AI 生成的技能草稿：建目录 + 写 SKILL.md + 建索引 */
   async createDraft(name: string, content: string): Promise<SkillInfo> {
-    const dir = await this.skillsDir()
-    const dest = path.join(dir, sanitizeName(name))
+    const root = await this.skillsDir()
+    const dest = path.join(root, AI_GROUP_DIR, sanitizeName(name))
     if (await exists(dest)) throw new Error(`技能 ${name} 已存在，请换一个目录名`)
     await fs.mkdir(dest, { recursive: true })
     await fs.writeFile(path.join(dest, SKILL_FILE), content, 'utf-8')
@@ -299,7 +450,8 @@ export class LibraryManager {
 
   /** AI 摘要应用：重写 SKILL.md 的 frontmatter description/tags */
   async applySummary(name: string, description: string, tags: string[]): Promise<SkillInfo> {
-    const dest = path.join(await this.skillsDir(), name)
+    const dest = await this.locateSkillDir(name)
+    if (!dest) throw new Error(`技能 ${name} 不在主库中`)
     const raw = await fs.readFile(path.join(dest, SKILL_FILE), 'utf-8')
     const { frontmatter, body } = parseFrontmatter(raw)
     const fm: Record<string, unknown> = { ...frontmatter, description, tags }
@@ -317,7 +469,7 @@ export class LibraryManager {
     return info ?? (await this.parseSkillDir(dest))!
   }
 
-  /** 本地导入：把任意目录复制进主库 */
+  /** 本地导入：把任意目录复制进主库（_local 分组） */
   async importLocal(srcDir: string, name?: string): Promise<SkillInfo> {
     const base = name || path.basename(srcDir)
     const clean = sanitizeName(base)
@@ -331,6 +483,62 @@ export class LibraryManager {
     }
     return this.install(srcDir, clean, source)
   }
+
+  // ---------- 旧布局迁移 ----------
+
+  /**
+   * 幂等迁移：把旧版扁平的 skillsDir/<技能>（含 SKILL.md）移动到 分组目录/<技能>。
+   * 按索引来源推导目标分组（缺失来源补本地），并补齐 groups[url].dir。
+   */
+  private async migrateLegacyLayout(root: string, index: LibraryIndex): Promise<LibraryIndex> {
+    let entries: import('fs').Dirent[] = []
+    try {
+      entries = await fs.readdir(root, { withFileTypes: true })
+    } catch {
+      return index
+    }
+    let changed = false
+    for (const d of entries.filter((e) => e.isDirectory())) {
+      const oldPath = path.join(root, d.name)
+      if (!(await exists(path.join(oldPath, SKILL_FILE)))) continue
+      // 已登记为分组目录的，不当作技能（异常时也跳过）
+      if (Object.values(index.groups).some((g) => g.dir === d.name)) continue
+      const meta = index.skills[d.name]
+      let source = meta?.source
+      if (!source) {
+        source = { kind: 'local', installedAt: new Date().toISOString() }
+        index.skills[d.name] = {
+          status: meta?.status ?? 'installed',
+          source
+        }
+        changed = true
+      }
+      let groupDir: string
+      if (source.kind === 'git' && source.url) {
+        const prevDir = index.groups[source.url]?.dir
+        groupDir = await this.ensureGroupDir(root, index, source.url, shortNameOf(source.url))
+        if (groupDir !== prevDir) changed = true
+      } else {
+        groupDir = source.kind === 'ai' ? AI_GROUP_DIR : LOCAL_GROUP_DIR
+      }
+      const dest = path.join(root, groupDir, d.name)
+      if (await exists(dest)) continue // 目标已被占用，保留原目录（scan 仍识别）
+      await fs.mkdir(path.dirname(dest), { recursive: true })
+      await fs.rename(oldPath, dest)
+      changed = true
+    }
+    if (changed) await this.saveIndex(index)
+    return index
+  }
+}
+
+/** 从仓库 url 提取短名（owner/repo），用于推导分组目录名 */
+export function shortNameOf(url: string): string {
+  const u = url.trim().replace(/\.git$/, '')
+  const m =
+    /(?:https?:\/\/|git@|ssh:\/\/git@)?([\w.-]+)\/([\w.-]+)$/.exec(u.replace(/^.*?:\/\//, ''))
+  if (m) return `${m[1]}/${m[2]}`
+  return u.replace(/^.*?:\/\//, '')
 }
 
 /** 解析 SKILL.md：--- frontmatter --- + 正文 */

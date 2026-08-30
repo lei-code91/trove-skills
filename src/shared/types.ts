@@ -69,6 +69,8 @@ export interface RepoGroup {
   note?: string
   installedAt: string
   lastUpdated?: string
+  /** 主库内分组目录名（如 anthropics-skills）；旧索引缺省，迁移时补齐 */
+  dir?: string
 }
 
 /** 主库扫描快照：技能列表 + 仓库分组 */
@@ -77,22 +79,43 @@ export interface LibrarySnapshot {
   groups: RepoGroup[]
 }
 
-/** 项目记录：项目文件夹 + 链接到库的技能 */
+/** 链接位点：一套技能集要应用到的目录（可多条，对应不同 Agent） */
+export interface LinksSite {
+  /** 目标目录绝对路径（~ 已在主进程展开） */
+  dir: string
+  /** 类型标记：claude 项目级 / global 用户级全局 / custom 自定义 */
+  kind: 'claude' | 'global' | 'custom'
+  /** 可选显示名 */
+  label?: string
+}
+
+/** 项目记录：项目文件夹 + 链接到库的技能（可含多条位点目录） */
 export interface ProjectRecord {
   id: string
   name: string
   path: string
-  /** 项目内 skills 子目录（链接安放处） */
+  /** 兼容旧数据：旧版单一链接目录，等价于 sites[0].dir */
   skillsDir: string
+  /** 链接位点集合（≥1），技能集统一应用到全部位点 */
+  sites: LinksSite[]
   linkedAt: string
   links: ProjectLink[]
 }
 
 export interface ProjectLink {
   skillName: string
+  /** 该链接所属位点目录 */
+  dir: string
   linkPath: string
   targetPath: string
   linkedAt: string
+}
+
+/** 全局链接配置：一套技能集链接到全局位点，对所有项目/Agent 生效 */
+export interface GlobalLinks {
+  sites: LinksSite[]
+  links: ProjectLink[]
+  updatedAt: string
 }
 
 /** LLM 配置档位（用户可保存多个并切换） */

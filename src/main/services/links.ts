@@ -2,7 +2,7 @@ import { promises as fs } from 'fs'
 import path from 'path'
 import os from 'os'
 import { randomUUID } from 'crypto'
-import type { ProjectLink, ProjectRecord } from '@shared/types'
+import type { GlobalLinks, LinksSite, ProjectLink, ProjectRecord } from '@shared/types'
 
 /** 展开 ~ / ~/xxx 为用户主目录 */
 function expandHome(p: string): string {
@@ -11,23 +11,95 @@ function expandHome(p: string): string {
   return p
 }
 
+/** 目录归一化：展开 ~、解析为绝对路径、去尾部斜杠（比较用） */
+export function normalizeDir(p: string): string {
+  return path.resolve(expandHome(p)).replace(/[\\/]+$/, '')
+}
+
+/** 位点归一化 */
+function normalizeSite(site: LinksSite): LinksSite {
+  return { ...site, dir: normalizeDir(site.dir) }
+}
+
+/** 归一化后按目录去重（保留首个），避免同一目录以不同写法重复出现 */
+function dedupeSites(sites: LinksSite[]): LinksSite[] {
+  const seen = new Set<string>()
+  const out: LinksSite[] = []
+  for (const s of sites) {
+    const dir = normalizeDir(s.dir)
+    if (seen.has(dir)) continue
+    seen.add(dir)
+    out.push({ ...s, dir })
+  }
+  return out
+}
+
+/** 旧项目数据的位点类型推导：全局目录 / 项目内 .claude/skills / 其它自定义 */
+function deduceKind(projectPath: string, dir: string): LinksSite['kind'] {
+  const normalized = normalizeDir(dir)
+  if (normalized === normalizeDir('~/.agents/skills')) return 'global'
+  if (normalized.startsWith(normalizeDir(projectPath) + path.sep) && normalized.endsWith('.claude' + path.sep + 'skills')) {
+    return 'claude'
+  }
+  return 'custom'
+}
+
+/** 旧项目数据迁移：补 sites 与每条 link 的 dir；新数据仅做归一化 */
+function migrateProject(p: ProjectRecord): ProjectRecord {
+  const record: ProjectRecord = { ...p, links: [...(p.links ?? [])] }
+  record.sites =
+    Array.isArray(p.sites) && p.sites.length > 0
+      ? p.sites.map(normalizeSite)
+      : [{ dir: normalizeDir(p.skillsDir), kind: deduceKind(p.path, p.skillsDir) }]
+  record.skillsDir = record.sites[0].dir
+  record.links = record.links.map((l) => ({ ...l, dir: l.dir || record.sites[0].dir }))
+  return record
+}
+
+/** 全局配置迁移（兼容缺省/旧格式） */
+function migrateGlobal(raw: Partial<GlobalLinks>): GlobalLinks {
+  const now = new Date().toISOString()
+  const sites =
+    Array.isArray(raw.sites) && raw.sites.length > 0
+      ? raw.sites.map(normalizeSite)
+      : [{ dir: normalizeDir('~/.agents/skills'), kind: 'global' as const, label: '用户级通用 Agent' }]
+  return {
+    sites,
+    links: Array.isArray(raw.links) ? raw.links.map((l) => ({ ...l, dir: l.dir || sites[0].dir })) : [],
+    updatedAt: raw.updatedAt || now
+  }
+}
+
+/** 合并新旧链接记录：以 (位点, 技能名) 为键，新记录优先 */
+function mergeLinks(existing: ProjectLink[], fresh: ProjectLink[]): ProjectLink[] {
+  const map = new Map<string, ProjectLink>()
+  for (const l of existing) map.set(`${l.dir}\u0000${l.skillName}`, l)
+  for (const l of fresh) map.set(`${l.dir}\u0000${l.skillName}`, l)
+  return [...map.values()]
+}
+
 /**
- * 项目链接服务：把主库中的技能用 junction（Windows）/ 符号链接（其它平台）映射到
- * 用户选择的项目文件夹的 skills 子目录。项目内的链接指向主库 → 主库更新后项目自动同步。
- * 链接与"安装"完全解耦：安装只进主库，永不直接写入 agent。
+ * 链接服务（全局 + 项目两级）：
+ * - 全局：一套技能集链接到全局位点（默认 ~/.agents/skills），对所有 Agent 生效
+ * - 项目：每个项目自己的技能集链接到该项目位点集合（可多条目录）
+ * 位点目录内的技能用 junction（Windows）/ 符号链接（其它平台）指向主库 → 主库更新后自动同步。
  */
 export class LinksManager {
   private readonly projectsFile: string
+  private readonly globalFile: string
 
   constructor(private readonly linksDir: () => string) {
     this.projectsFile = path.join(linksDir(), 'projects.json')
+    this.globalFile = path.join(linksDir(), 'global-links.json')
   }
+
+  // ---------- 数据读写 ----------
 
   private async load(): Promise<ProjectRecord[]> {
     try {
       const raw = await fs.readFile(this.projectsFile, 'utf-8')
       const list = JSON.parse(raw) as ProjectRecord[]
-      return Array.isArray(list) ? list : []
+      return (Array.isArray(list) ? list : []).map(migrateProject)
     } catch {
       return []
     }
@@ -40,24 +112,103 @@ export class LinksManager {
     await fs.rename(tmp, this.projectsFile)
   }
 
-  /** 添加项目（若已存在则返回现有记录）；linksRel：链接目录（相对项目根、绝对路径或 ~ 用户级目录），默认 skills */
-  async addProject(projectPath: string, linksRel?: string): Promise<ProjectRecord> {
+  private async loadGlobal(): Promise<GlobalLinks> {
+    try {
+      const raw = await fs.readFile(this.globalFile, 'utf-8')
+      return migrateGlobal(JSON.parse(raw))
+    } catch {
+      return migrateGlobal({})
+    }
+  }
+
+  private async saveGlobal(config: GlobalLinks): Promise<void> {
+    await fs.mkdir(this.linksDir(), { recursive: true })
+    const tmp = this.globalFile + '.tmp'
+    await fs.writeFile(tmp, JSON.stringify(config, null, 2), 'utf-8')
+    await fs.rename(tmp, this.globalFile)
+  }
+
+  /** 链接探活：只保留仍是符号链接的记录 */
+  private async aliveLinks(links: ProjectLink[]): Promise<ProjectLink[]> {
+    const alive: ProjectLink[] = []
+    for (const link of links) {
+      try {
+        const st = await fs.lstat(link.linkPath)
+        if (st.isSymbolicLink()) alive.push(link)
+      } catch {
+        // 链接丢失
+      }
+    }
+    return alive
+  }
+
+  // ---------- 链接基本操作 ----------
+
+  /** 对每个位点创建链接（缺失的建 junction/符号链接）；已有符号链接视为既有链接返回记录 */
+  private async applyLinkSet(
+    sites: LinksSite[],
+    skillNames: string[],
+    getSkillDir: (name: string) => Promise<string>
+  ): Promise<ProjectLink[]> {
+    const links: ProjectLink[] = []
+    for (const site of sites) {
+      await fs.mkdir(site.dir, { recursive: true })
+      for (const name of skillNames) {
+        const target = await getSkillDir(name) // 校验在主库
+        const linkPath = path.join(site.dir, name)
+        const st = await lstatSafe(linkPath)
+        if (st?.isSymbolicLink()) {
+          links.push({ skillName: name, dir: site.dir, linkPath, targetPath: target, linkedAt: new Date().toISOString() })
+          continue
+        }
+        if (st) {
+          throw new Error(`链接目录已存在同名内容（非链接）：${linkPath}，请先处理`)
+        }
+        // junction：Windows 上目录链接不需要管理员权限；其它平台用 dir symlink
+        const type = process.platform === 'win32' ? 'junction' : 'dir'
+        await fs.symlink(target, linkPath, type)
+        links.push({ skillName: name, dir: site.dir, linkPath, targetPath: target, linkedAt: new Date().toISOString() })
+      }
+    }
+    return links
+  }
+
+  /** 同步断开：断开 (位点, 技能) 不在目标组合内的既有链接，返回保留的链接 */
+  private async syncRemove(
+    links: ProjectLink[],
+    sites: LinksSite[],
+    skillNames: string[]
+  ): Promise<ProjectLink[]> {
+    const keepKeys = new Set(sites.flatMap((s) => skillNames.map((n) => `${s.dir}\u0000${n}`)))
+    const kept: ProjectLink[] = []
+    for (const link of links) {
+      if (keepKeys.has(`${link.dir}\u0000${link.skillName}`)) kept.push(link)
+      else await this.safeRemoveLink(link.linkPath)
+    }
+    return kept
+  }
+
+  // ---------- 项目 ----------
+
+  /** 添加项目（已存在则返回现有记录）；sites 缺省时为项目内 skills 目录 */
+  async addProject(projectPath: string, sites?: LinksSite[]): Promise<ProjectRecord> {
     const absolute = path.resolve(projectPath)
     const stat = await fs.stat(absolute)
     if (!stat.isDirectory()) throw new Error('所选路径不是文件夹')
     const list = await this.load()
     const existing = list.find((p) => path.resolve(p.path) === absolute)
     if (existing) return existing
-    const rel = expandHome(linksRel ?? 'skills')
-    const skillsDir = path.isAbsolute(rel)
-      ? path.resolve(rel)
-      : path.join(absolute, rel)
-    await fs.mkdir(skillsDir, { recursive: true })
+    const normalized = dedupeSites(sites ?? [])
+    if (normalized.length === 0) {
+      normalized.push({ dir: path.join(absolute, 'skills'), kind: 'custom' })
+    }
+    for (const s of normalized) await fs.mkdir(s.dir, { recursive: true })
     const record: ProjectRecord = {
       id: randomUUID(),
       name: path.basename(absolute),
       path: absolute,
-      skillsDir,
+      skillsDir: normalized[0].dir,
+      sites: normalized,
       linkedAt: new Date().toISOString(),
       links: []
     }
@@ -66,25 +217,30 @@ export class LinksManager {
     return record
   }
 
-  /** 变更链接目录：断开全部旧链接 → 在新目录重建（保持链接集合） */
-  async changeLinksDir(
+  /** 变更项目位点集合：断开不在新位点的链接，为新位点重建既有技能集 */
+  async setSites(
     projectId: string,
-    newDir: string,
+    sites: LinksSite[],
     getSkillDir: (name: string) => Promise<string>
   ): Promise<ProjectRecord> {
     const list = await this.load()
     const record = list.find((p) => p.id === projectId)
     if (!record) throw new Error('项目不存在')
-    const names = record.links.map((l) => l.skillName)
-    for (const link of record.links) {
-      await this.safeRemoveLink(link.linkPath)
+    const normalized = dedupeSites(sites)
+    const siteDirs = new Set(normalized.map((s) => s.dir))
+    for (const link of [...record.links]) {
+      if (!siteDirs.has(link.dir)) {
+        await this.safeRemoveLink(link.linkPath)
+        record.links = record.links.filter((l) => l !== link)
+      }
     }
-    record.links = []
-    record.skillsDir = path.resolve(expandHome(newDir))
-    await fs.mkdir(record.skillsDir, { recursive: true })
-    // 先落盘再重建：linkSkills 内部会重新 load，视新目录为当前状态
+    const names = [...new Set(record.links.map((l) => l.skillName))]
+    const fresh = await this.applyLinkSet(normalized, names, getSkillDir)
+    record.sites = normalized
+    record.skillsDir = normalized[0]?.dir ?? record.skillsDir
+    record.links = mergeLinks(record.links, fresh)
     await this.save(list)
-    return this.linkSkills(projectId, names, getSkillDir)
+    return record
   }
 
   async removeProject(id: string, unlinkAll = true): Promise<void> {
@@ -103,28 +259,20 @@ export class LinksManager {
 
   async listProjects(): Promise<ProjectRecord[]> {
     const list = await this.load()
-    // 同步实际链接状态：README 探活（若无 skillsDir 则不重建）
+    let changed = false
     for (const record of list) {
-      const alive: ProjectLink[] = []
-      for (const link of record.links) {
-        try {
-          const st = await fs.lstat(link.linkPath)
-          if (st.isSymbolicLink()) {
-            alive.push(link)
-            continue
-          }
-        } catch {
-          // 链接丢失
-        }
+      const alive = await this.aliveLinks(record.links)
+      if (alive.length !== record.links.length) {
+        record.links = alive
+        changed = true
       }
-      record.links = alive
     }
-    await this.save(list)
+    if (changed) await this.save(list)
     return list
   }
 
-  /** 把技能链接进项目 skills 目录（多个技能一次批量）；sync=true 时全量对齐：未勾选的既有链接一并断开 */
-  async linkSkills(
+  /** 把技能链接进项目全部位点；sync=true 时全量对齐：未勾选的既有链接一并断开 */
+  async linkProject(
     projectId: string,
     skillNames: string[],
     getSkillDir: (name: string) => Promise<string>,
@@ -133,44 +281,11 @@ export class LinksManager {
     const list = await this.load()
     const record = list.find((p) => p.id === projectId)
     if (!record) throw new Error('项目不存在')
-    await fs.mkdir(record.skillsDir, { recursive: true })
-    for (const name of skillNames) {
-      if (record.links.some((l) => l.skillName === name)) continue
-      const target = await getSkillDir(name) // 校验在主库
-      const linkPath = path.join(record.skillsDir, name)
-      const st = await lstatSafe(linkPath)
-      if (st?.isSymbolicLink()) {
-        // 已存在链接：视为既有链接，更新记录
-        record.links.push({
-          skillName: name,
-          linkPath,
-          targetPath: target,
-          linkedAt: new Date().toISOString()
-        })
-        continue
-      }
-      if (st) {
-        throw new Error(`项目 skills 目录已存在同名内容（非链接）：${linkPath}，请先处理`)
-      }
-      // junction：Windows 上目录链接不需要管理员权限；其它平台用 dir symlink
-      const type = process.platform === 'win32' ? 'junction' : 'dir'
-      await fs.symlink(target, linkPath, type)
-      record.links.push({
-        skillName: name,
-        linkPath,
-        targetPath: target,
-        linkedAt: new Date().toISOString()
-      })
-    }
-    // sync：断开未勾选的既有链接（管理弹窗“保存”语义）
-    if (sync) {
-      for (const link of [...record.links]) {
-        if (!skillNames.includes(link.skillName)) {
-          await this.safeRemoveLink(link.linkPath)
-          record.links = record.links.filter((l) => l.skillName !== link.skillName)
-        }
-      }
-    }
+    const fresh = await this.applyLinkSet(record.sites, skillNames, getSkillDir)
+    record.links = sync
+      ? await this.syncRemove(record.links, record.sites, skillNames)
+      : record.links
+    record.links = mergeLinks(record.links, fresh)
     await this.save(list)
     return record
   }
@@ -179,13 +294,79 @@ export class LinksManager {
     const list = await this.load()
     const record = list.find((p) => p.id === projectId)
     if (!record) throw new Error('项目不存在')
-    const link = record.links.find((l) => l.skillName === skillName)
-    if (link) {
+    const targets = record.links.filter((l) => l.skillName === skillName)
+    for (const link of targets) {
       await this.safeRemoveLink(link.linkPath)
+    }
+    if (targets.length > 0) {
       record.links = record.links.filter((l) => l.skillName !== skillName)
       await this.save(list)
     }
     return record
+  }
+
+  // ---------- 全局链接 ----------
+
+  async getGlobalLinks(): Promise<GlobalLinks> {
+    const config = await this.loadGlobal()
+    const alive = await this.aliveLinks(config.links)
+    if (alive.length !== config.links.length) {
+      config.links = alive
+      await this.saveGlobal(config)
+    }
+    return config
+  }
+
+  /** 设定全局位点集合：断开不在新位点的链接，为新位点重建既有技能集 */
+  async setGlobalSites(
+    sites: LinksSite[],
+    getSkillDir: (name: string) => Promise<string>
+  ): Promise<GlobalLinks> {
+    const config = await this.loadGlobal()
+    const normalized = dedupeSites(sites)
+    const siteDirs = new Set(normalized.map((s) => s.dir))
+    for (const link of [...config.links]) {
+      if (!siteDirs.has(link.dir)) {
+        await this.safeRemoveLink(link.linkPath)
+        config.links = config.links.filter((l) => l !== link)
+      }
+    }
+    const names = [...new Set(config.links.map((l) => l.skillName))]
+    const fresh = await this.applyLinkSet(normalized, names, getSkillDir)
+    config.sites = normalized
+    config.links = mergeLinks(config.links, fresh)
+    config.updatedAt = new Date().toISOString()
+    await this.saveGlobal(config)
+    return config
+  }
+
+  /** 把技能链接进全局全部位点；sync=true 时未勾选的既有链接一并断开 */
+  async linkGlobal(
+    skillNames: string[],
+    getSkillDir: (name: string) => Promise<string>,
+    sync = false
+  ): Promise<GlobalLinks> {
+    const config = await this.loadGlobal()
+    const fresh = await this.applyLinkSet(config.sites, skillNames, getSkillDir)
+    config.links = sync ? await this.syncRemove(config.links, config.sites, skillNames) : config.links
+    config.links = mergeLinks(config.links, fresh)
+    config.updatedAt = new Date().toISOString()
+    await this.saveGlobal(config)
+    return config
+  }
+
+  async unlinkGlobal(skillName: string): Promise<GlobalLinks> {
+    const config = await this.loadGlobal()
+    const targets = config.links.filter((l) => l.skillName === skillName)
+    for (const link of targets) {
+      await this.safeRemoveLink(link.linkPath)
+    }
+    if (targets.length > 0) {
+      config.links = config.links.filter((l) => l.skillName !== skillName)
+      config.updatedAt = new Date().toISOString()
+      await this.saveGlobal(config)
+    }
+    return config
   }
 
   /** 删除前再次确认是符号链接，绝不递归删除真实目录 */

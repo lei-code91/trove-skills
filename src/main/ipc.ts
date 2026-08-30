@@ -5,6 +5,7 @@ import { randomUUID } from 'crypto'
 import type {
   AppSettings,
   InstallPreview,
+  LinksSite,
   LlmProfile,
   SkillInfo,
   SkillStatus
@@ -294,7 +295,7 @@ export class IpcRegistrar {
       return this.library.importLocal(srcDir, name)
     })
 
-    // ---------- 项目链接 ----------
+    // ---------- 项目链接（全局 + 项目两级） ----------
     ipcMain.handle('links:listProjects', () => this.links.listProjects())
     ipcMain.handle('links:addProject', async () => {
       const win = BrowserWindow.getFocusedWindow()
@@ -315,20 +316,20 @@ export class IpcRegistrar {
       })
       return r.canceled ? null : r.filePaths[0]
     })
-    ipcMain.handle('links:addProjectByPath', (_e, projectPath: string, linksRel?: string) =>
-      this.links.addProject(projectPath, linksRel)
+    ipcMain.handle('links:addProjectByPath', (_e, projectPath: string, sites: LinksSite[]) =>
+      this.links.addProject(projectPath, sites)
     )
-    ipcMain.handle('links:chooseLinksDir', async () => {
+    ipcMain.handle('links:chooseLinksDirs', async () => {
       const win = BrowserWindow.getFocusedWindow()
       if (!win) return null
       const r = await dialog.showOpenDialog(win, {
-        title: '选择技能链接目录（Agent 从此目录读取技能）',
-        properties: ['openDirectory', 'createDirectory']
+        title: '选择技能链接目录（Agent 从此目录读取技能，可多选）',
+        properties: ['openDirectory', 'createDirectory', 'multiSelections']
       })
-      return r.canceled ? null : r.filePaths[0]
+      return r.canceled || r.filePaths.length === 0 ? null : r.filePaths
     })
-    ipcMain.handle('links:changeDir', async (_e, projectId: string, newDir: string) =>
-      this.links.changeLinksDir(projectId, newDir, (name) => this.library.resolveSkillDir(name))
+    ipcMain.handle('links:setSites', (_e, projectId: string, sites: LinksSite[]) =>
+      this.links.setSites(projectId, sites, (name) => this.library.resolveSkillDir(name))
     )
     ipcMain.handle('links:removeProject', (_e, id: string, unlinkAll: boolean) =>
       this.links.removeProject(id, unlinkAll)
@@ -336,7 +337,7 @@ export class IpcRegistrar {
     ipcMain.handle(
       'links:link',
       (_e, projectId: string, skillNames: string[], sync?: boolean) =>
-        this.links.linkSkills(
+        this.links.linkProject(
           projectId,
           skillNames,
           (name) => this.library.resolveSkillDir(name),
@@ -345,6 +346,17 @@ export class IpcRegistrar {
     )
     ipcMain.handle('links:unlink', (_e, projectId: string, skillName: string) =>
       this.links.unlinkSkill(projectId, skillName)
+    )
+    // 全局链接：一套技能集，对所有项目 / Agent 生效
+    ipcMain.handle('links:getGlobal', () => this.links.getGlobalLinks())
+    ipcMain.handle('links:setGlobalSites', (_e, sites: LinksSite[]) =>
+      this.links.setGlobalSites(sites, (name) => this.library.resolveSkillDir(name))
+    )
+    ipcMain.handle('links:linkGlobal', (_e, skillNames: string[], sync?: boolean) =>
+      this.links.linkGlobal(skillNames, (name) => this.library.resolveSkillDir(name), sync)
+    )
+    ipcMain.handle('links:unlinkGlobal', (_e, skillName: string) =>
+      this.links.unlinkGlobal(skillName)
     )
 
     // ---------- LLM ----------

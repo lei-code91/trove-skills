@@ -1,8 +1,10 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import type {
   AppSettings,
+  GlobalLinks,
   InstallPreview,
   LibrarySnapshot,
+  LinksSite,
   LlmProfile,
   ProjectRecord,
   SkillInfo,
@@ -78,15 +80,15 @@ const api = {
     return () => ipcRenderer.removeListener('install:progress', listener)
   },
 
-  // 项目链接
+  // 项目链接（全局 + 项目两级）
   listProjects: (): Promise<ProjectRecord[]> => ipcRenderer.invoke('links:listProjects'),
   addProject: (): Promise<ProjectRecord | null> => ipcRenderer.invoke('links:addProject'),
   chooseProjectDir: (): Promise<string | null> => ipcRenderer.invoke('links:chooseProjectDir'),
-  addProjectByPath: (projectPath: string, linksRel?: string): Promise<ProjectRecord> =>
-    ipcRenderer.invoke('links:addProjectByPath', projectPath, linksRel),
-  chooseLinksDir: (): Promise<string | null> => ipcRenderer.invoke('links:chooseLinksDir'),
-  changeLinksDir: (projectId: string, newDir: string): Promise<ProjectRecord> =>
-    ipcRenderer.invoke('links:changeDir', projectId, newDir),
+  addProjectByPath: (projectPath: string, sites: LinksSite[]): Promise<ProjectRecord> =>
+    ipcRenderer.invoke('links:addProjectByPath', projectPath, sites),
+  chooseLinksDirs: (): Promise<string[] | null> => ipcRenderer.invoke('links:chooseLinksDirs'),
+  setProjectSites: (projectId: string, sites: LinksSite[]): Promise<ProjectRecord> =>
+    ipcRenderer.invoke('links:setSites', projectId, sites),
   removeProject: (id: string, unlinkAll = true): Promise<void> =>
     ipcRenderer.invoke('links:removeProject', id, unlinkAll),
   linkSkills: (
@@ -96,6 +98,15 @@ const api = {
   ): Promise<ProjectRecord> => ipcRenderer.invoke('links:link', projectId, skillNames, sync),
   unlinkSkill: (projectId: string, skillName: string): Promise<ProjectRecord> =>
     ipcRenderer.invoke('links:unlink', projectId, skillName),
+  // 全局链接
+  getGlobalLinks: (): Promise<GlobalLinks> => ipcRenderer.invoke('links:getGlobal'),
+  setGlobalSites: (
+    sites: LinksSite[]
+  ): Promise<GlobalLinks> => ipcRenderer.invoke('links:setGlobalSites', sites),
+  linkGlobal: (skillNames: string[], sync?: boolean): Promise<GlobalLinks> =>
+    ipcRenderer.invoke('links:linkGlobal', skillNames, sync),
+  unlinkGlobal: (skillName: string): Promise<GlobalLinks> =>
+    ipcRenderer.invoke('links:unlinkGlobal', skillName),
 
   // LLM
   listModels: (profile: LlmProfile): Promise<string[]> =>
